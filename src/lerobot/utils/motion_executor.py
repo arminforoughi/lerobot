@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 
@@ -38,6 +40,12 @@ class MotionExecutionConfig:
     settle_dt: float = 0.03
     # Legacy joint-only fallback
     max_joint_step_deg: float = 5.0
+    # Passed to ``RobotKinematics.inverse_kinematics`` on each micro-step.
+    ik_position_weight: float = 1.0
+    ik_orientation_weight: float = 0.01
+    # Reserved for richer reach / wrist policies (visual servo scripts may set these).
+    cartesian_translate_first_on_reach: bool = False
+    lock_wrist_roll_on_coarse_reach: bool = False
 
 
 def wait_for_convergence(
@@ -151,7 +159,12 @@ def execute_waypoint(
         n = max(motion.min_steps_per_segment, int(np.ceil(dist / max(motion.cartesian_step_m, 1e-6))))
         n = max(1, n)
     else:
-        joint_end = kinematics.inverse_kinematics(current_joints, T_target)
+        joint_end = kinematics.inverse_kinematics(
+            current_joints,
+            T_target,
+            position_weight=motion.ik_position_weight,
+            orientation_weight=motion.ik_orientation_weight,
+        )
         delta_j = joint_end - current_joints
         max_delta = float(np.max(np.abs(delta_j))) if delta_j.size > 0 else 0.0
         n = max(1, int(np.ceil(max_delta / max(motion.max_joint_step_deg, 1e-6))))
@@ -160,7 +173,12 @@ def execute_waypoint(
         alpha = step / n
         if motion.use_cartesian_interp:
             T_i = interpolate_se3(T_start, T_target, alpha)
-            joint_target = kinematics.inverse_kinematics(current_joints, T_i)
+            joint_target = kinematics.inverse_kinematics(
+                current_joints,
+                T_i,
+                position_weight=motion.ik_position_weight,
+                orientation_weight=motion.ik_orientation_weight,
+            )
         else:
             joint_target = current_joints + delta_j * alpha
 
@@ -245,7 +263,12 @@ def execute_waypoint_microsteps(
         n = max(motion.min_steps_per_segment, int(np.ceil(dist / max(motion.cartesian_step_m, 1e-6))))
         n = max(1, n)
     else:
-        joint_end = kinematics.inverse_kinematics(current_joints, T_target)
+        joint_end = kinematics.inverse_kinematics(
+            current_joints,
+            T_target,
+            position_weight=motion.ik_position_weight,
+            orientation_weight=motion.ik_orientation_weight,
+        )
         delta_j = joint_end - current_joints
         max_delta = float(np.max(np.abs(delta_j))) if delta_j.size > 0 else 0.0
         n = max(1, int(np.ceil(max_delta / max(motion.max_joint_step_deg, 1e-6))))
@@ -257,7 +280,12 @@ def execute_waypoint_microsteps(
         alpha = step / n
         if motion.use_cartesian_interp:
             T_i = interpolate_se3(T_start, T_target, alpha)
-            joint_target = kinematics.inverse_kinematics(current_joints, T_i)
+            joint_target = kinematics.inverse_kinematics(
+                current_joints,
+                T_i,
+                position_weight=motion.ik_position_weight,
+                orientation_weight=motion.ik_orientation_weight,
+            )
         else:
             joint_target = current_joints + delta_j * alpha  # type: ignore[name-defined]
 
@@ -309,3 +337,105 @@ def execute_waypoint_microsteps(
             time.sleep(0.28)
 
     return current_joints, microstep_index, done
+
+
+def _gripper_cmd_from_obs(obs: dict[str, Any]) -> tuple[bool, float]:
+    """Map current observation gripper command to (gripper_open, width_pct) for _build_action."""
+    raw = obs.get("gripper.pos")
+    if raw is None:
+        return True, 100.0
+    v = float(raw)
+    if v >= 90.0:
+        return True, 100.0
+    return False, float(np.clip(v, 0.0, 100.0))
+
+
+def execute_pose_waypoint_base(
+    robot,
+    kinematics,
+    motor_names: list[str],
+    T_target: np.ndarray,
+    motion: MotionExecutionConfig | None = None,
+    *,
+    label: str = "pose_base",
+) -> None:
+    """Move the EE toward ``T_target`` (4x4, base/world frame) using Cartesian micro-steps; keep gripper as-is."""
+    motion = motion or MotionExecutionConfig()
+    obs = robot.get_observation()
+    current_joints = np.array([float(obs[f"{m}.pos"]) for m in motor_names], dtype=np.float64)
+    g_open, g_pct = _gripper_cmd_from_obs(obs)
+    wp = SimpleNamespace(
+        pose_4x4=np.asarray(T_target, dtype=np.float64),
+        gripper_open=g_open,
+        gripper_width_pct=g_pct,
+        label=label,
+    )
+    execute_waypoint(robot, kinematics, wp, motor_names, motion, current_joints=current_joints)
+
+
+def execute_pose_chain_base(
+    robot,
+    kinematics,
+    motor_names: list[str],
+    T_targets: list[np.ndarray],
+    motion: MotionExecutionConfig | None = None,
+    *,
+    labels: list[str] | None = None,
+) -> None:
+    """Run a list of base-frame EE pose waypoints back-to-back without re-observing between them.
+
+    This is the key to "smooth arc" motion: between segments there is no robot
+    observation, no settle wait, no outer-loop work — the Cartesian micro-step streamer
+    just keeps feeding joint targets. Each segment uses Cartesian SLERP from the prior
+    segment's endpoint, so a corner between [lift_corner → hover] turns into a
+    continuously-interpolated blend when the two segments share the same ``motion``
+    config (especially ``settle_last_step=False``).
+    """
+    if not T_targets:
+        return
+    motion = motion or MotionExecutionConfig()
+    obs = robot.get_observation()
+    current_joints = np.array(
+        [float(obs[f"{m}.pos"]) for m in motor_names], dtype=np.float64
+    )
+    g_open, g_pct = _gripper_cmd_from_obs(obs)
+    if labels is None:
+        labels = [f"chain_{i}" for i in range(len(T_targets))]
+    for i, T_i in enumerate(T_targets):
+        wp = SimpleNamespace(
+            pose_4x4=np.asarray(T_i, dtype=np.float64),
+            gripper_open=g_open,
+            gripper_width_pct=g_pct,
+            label=labels[i] if i < len(labels) else f"chain_{i}",
+        )
+        current_joints = execute_waypoint(
+            robot, kinematics, wp, motor_names, motion,
+            current_joints=current_joints,
+        )
+
+
+def execute_cartesian_nudge_base(
+    robot,
+    kinematics,
+    motor_names: list[str],
+    delta_base: np.ndarray,
+    motion: MotionExecutionConfig | None = None,
+) -> None:
+    """Apply a small base-frame translation to the current EE pose (orientation unchanged)."""
+    delta = np.asarray(delta_base, dtype=np.float64).reshape(3)
+    if float(np.linalg.norm(delta)) < 1e-9:
+        return
+    motion = motion or MotionExecutionConfig()
+    obs = robot.get_observation()
+    current_joints = np.array([float(obs[f"{m}.pos"]) for m in motor_names], dtype=np.float64)
+    T_start = kinematics.forward_kinematics(current_joints)
+    T_target = np.asarray(T_start, dtype=np.float64).copy()
+    T_target[:3, 3] = T_target[:3, 3] + delta
+    g_open, g_pct = _gripper_cmd_from_obs(obs)
+    wp = SimpleNamespace(
+        pose_4x4=T_target,
+        gripper_open=g_open,
+        gripper_width_pct=g_pct,
+        label="cartesian_nudge",
+    )
+    execute_waypoint(robot, kinematics, wp, motor_names, motion, current_joints=current_joints)

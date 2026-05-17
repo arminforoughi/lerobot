@@ -46,10 +46,24 @@ def init_rerun(
         rr.connect_grpc(url=f"rerun+http://{ip}:{port}/proxy")
     else:
         rr.spawn(memory_limit=memory_limit)
+    try:
+        rr.disable_batching()
+    except Exception:
+        pass
 
 
-def send_agentic_rerun_blueprint(*, show_camera_stream: bool, show_sim3d: bool) -> None:
-    """Push a default blueprint so the viewer opens with a Spatial 3D tab for ``sim3d/*``."""
+def send_agentic_rerun_blueprint(
+    *,
+    show_camera_stream: bool,
+    show_sim3d: bool,
+    camera_key: str | None = None,
+) -> None:
+    """Push a default blueprint: separate RGB + depth 2D views and the 3D sim view.
+
+    When ``camera_key`` is provided we create two Spatial2DViews — one targeting
+    ``observation/{camera_key}`` (RGB) and one targeting ``observation/{camera_key}_depth``
+    (colorized depth) — so the viewer shows both side by side instead of picking just one.
+    """
     if not show_camera_stream and not show_sim3d:
         return
     try:
@@ -57,27 +71,45 @@ def send_agentic_rerun_blueprint(*, show_camera_stream: bool, show_sim3d: bool) 
     except Exception as e:
         logger.warning("Rerun blueprint API unavailable: %s", e)
         return
-    views: list = []
-    if show_camera_stream:
-        v2d = None
+
+    def _make_2d(name: str, contents: str):
+        origin = contents.rstrip("/*")
+        # Prefer origin= (pins the view to a specific entity so RGB and depth
+        # render in distinct panels instead of getting de-duplicated by
+        # auto-layout when both share the `observation/**` subtree).
         for kwargs in (
-            {"name": "Camera (RGB + depth)", "contents": "observation/**"},
-            {"name": "Camera", "origin": "observation"},
+            {"name": name, "origin": origin, "contents": f"{origin}/**"},
+            {"name": name, "origin": origin},
+            {"name": name, "contents": contents},
         ):
             try:
-                v2d = rrb.Spatial2DView(**kwargs)
-                break
+                return rrb.Spatial2DView(**kwargs)
             except TypeError:
                 continue
-        if v2d is None:
-            try:
-                v2d = rrb.Spatial2DView(name="Camera")
-            except Exception:
-                v2d = None
-        if v2d is not None:
-            views.append(v2d)
+            except Exception as e:
+                logger.debug("Spatial2DView(%s) failed: %s", kwargs, e)
+                continue
+        try:
+            return rrb.Spatial2DView(name=name)
+        except Exception:
+            return None
+
+    cam_views: list = []
+    if show_camera_stream:
+        if camera_key:
+            rgb_v = _make_2d("Camera RGB", f"observation/{camera_key}")
+            depth_v = _make_2d("Camera depth", f"observation/{camera_key}_depth")
+            if rgb_v is not None:
+                cam_views.append(rgb_v)
+            if depth_v is not None:
+                cam_views.append(depth_v)
+        else:
+            v = _make_2d("Camera (RGB + depth)", "observation/**")
+            if v is not None:
+                cam_views.append(v)
+
+    v3d = None
     if show_sim3d:
-        v3d = None
         for kwargs in (
             {"name": "SO101 + scene (base frame)", "contents": "sim3d/**"},
             {"name": "SO101 + scene (base frame)", "origin": "sim3d"},
@@ -92,24 +124,36 @@ def send_agentic_rerun_blueprint(*, show_camera_stream: bool, show_sim3d: bool) 
                 v3d = rrb.Spatial3DView(name="SO101 + scene (base frame)")
             except Exception as e:
                 logger.warning("Could not create Spatial3DView: %s", e)
-        if v3d is not None:
-            views.append(v3d)
-    if not views:
+
+    if not cam_views and v3d is None:
         return
     try:
-        if len(views) == 1:
-            root = views[0]
-        else:
+        if cam_views and v3d is not None:
+            if len(cam_views) > 1:
+                try:
+                    cam_panel = rrb.Vertical(*cam_views)
+                except Exception:
+                    try:
+                        cam_panel = rrb.Tabs(*cam_views)
+                    except Exception:
+                        cam_panel = cam_views[0]
+            else:
+                cam_panel = cam_views[0]
             try:
-                root = rrb.Horizontal(*views, column_shares=[1, 2])
+                root = rrb.Horizontal(cam_panel, v3d, column_shares=[1, 2])
             except TypeError:
-                root = rrb.Horizontal(*views)
+                root = rrb.Horizontal(cam_panel, v3d)
+        elif cam_views:
+            root = cam_views[0] if len(cam_views) == 1 else rrb.Vertical(*cam_views)
+        else:
+            root = v3d
         bp = rrb.Blueprint(root, auto_layout=True)
         rr.send_blueprint(bp, make_active=True, make_default=True)
+        n_total = len(cam_views) + (1 if v3d is not None else 0)
         logger.info(
             "Rerun blueprint: opened %d view(s) including 3D (robot base frame). "
             "Use the 'SO101 + scene' panel if you do not see the arm.",
-            len(views),
+            n_total,
         )
     except Exception as e:
         logger.warning(

@@ -99,6 +99,7 @@ def log_manipulation_sim3d(
     focus_object_index: int | None = None,
     planned_ee_positions_base: np.ndarray | None = None,
     plan_summary: str | None = None,
+    ground_plane_z_m: float = 0.0,
 ) -> None:
     """Log a 3D scene slice on the same ``frame`` timeline as camera streams.
 
@@ -112,6 +113,8 @@ def log_manipulation_sim3d(
         focus_object_index: Highlight this row in ``object_centers_base`` (pick target).
         planned_ee_positions_base: (M, 3) planned EE path (e.g. waypoint origins).
         plan_summary: Short text (e.g. pick label + action).
+        ground_plane_z_m: Z level (m, base frame) for the workspace grid; match your tabletop
+            height in the URDF base frame when objects look ``below`` Z=0 in the viewer.
     """
     import rerun as rr
 
@@ -170,17 +173,18 @@ def log_manipulation_sim3d(
     except Exception as e:
         logger.warning("display_sim3d: failed to log robot chain: %s", e)
 
-    # Ground grid (robot base / URDF world XY, Z=0) so scale is obvious in the 3D view.
+    # Ground grid (robot base / URDF world XY at ``ground_plane_z_m``) so scale is obvious.
     try:
         half_w = 0.4
         n = 10
+        gz = float(ground_plane_z_m)
         grid_strips: list[np.ndarray] = []
         for i in range(n + 1):
             t = -half_w + (2.0 * half_w) * i / n
-            grid_strips.append(np.array([[t, -half_w, 0.0], [t, half_w, 0.0]], dtype=np.float64))
+            grid_strips.append(np.array([[t, -half_w, gz], [t, half_w, gz]], dtype=np.float64))
         for i in range(n + 1):
             t = -half_w + (2.0 * half_w) * i / n
-            grid_strips.append(np.array([[-half_w, t, 0.0], [half_w, t, 0.0]], dtype=np.float64))
+            grid_strips.append(np.array([[-half_w, t, gz], [half_w, t, gz]], dtype=np.float64))
         rr.log(
             "sim3d/workspace/ground_grid",
             rr.LineStrips3D(
@@ -235,13 +239,17 @@ def log_manipulation_sim3d(
                     if is_focus:
                         base_rgb = np.array([[255, 45, 220]], dtype=np.uint8)
                     cols = np.tile(base_rgb, (Vc.shape[0], 1))
-                    if object_labels and i < len(object_labels):
+                    # Stable path so Rerun does not keep stale meshes when ``tag``/label changes (e.g. PBVS→VLM).
+                    if n == 1:
+                        mesh_path = "sim3d/objects/target_proxy"
+                    elif object_labels and i < len(object_labels):
                         tag = _safe_entity_name(str(object_labels[i]))
+                        mesh_path = f"sim3d/objects/cube_{i}_{tag}"
                     else:
-                        tag = f"obj{i}"
+                        mesh_path = f"sim3d/objects/cube_{i}"
                     _log_mesh3d(
                         rr,
-                        f"sim3d/objects/cube_{i}_{tag}",
+                        mesh_path,
                         Vc,
                         Fc,
                         cols,
