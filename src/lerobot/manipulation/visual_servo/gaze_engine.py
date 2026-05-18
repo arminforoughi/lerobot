@@ -26,8 +26,9 @@ State machine:
   PREPOSITIONING (optional) → sphere + look-at IK; **emergency gaze** when
               pixel error exceeds ``preposition_emergency_gaze_pixel_threshold_px``
               freezes orbit IK and re-centers so the target stays in view.
-  TRACKING  → gaze only until centered, then APPROACHING (or live ``preposition``).
-  APPROACHING → radial approach + visibility-regulated depth toward standoff.
+  PAN_ALIGN → shoulder_pan (j1) only until the bbox is centered in u; then approach.
+  TRACKING  → gaze only until centered, then PAN_ALIGN or APPROACHING.
+  APPROACHING → radial approach + look-at IK (blocked until PAN_ALIGN done).
   HOLD      → depth within tolerance of standoff; maintain gaze.
 
 This is intentionally separate from ``cvs_engine`` — the goal is to never let
@@ -55,13 +56,14 @@ from lerobot.manipulation.visual_servo.cvs_engine import (
     approach_unit_vector,
     build_look_at_R,
 )
-from lerobot.manipulation.yolo_track.depth import depth_from_bbox_size
+from lerobot.manipulation.yolo_track.depth import depth_from_bbox_size, median_depth_m
 from lerobot.manipulation.yolo_track.math_utils import (
     parse_tf_string,
     point_cam_to_base,
 )
 from lerobot.robots import RobotConfig, make_robot_from_config
 from lerobot.robots.so_follower import SOFollowerRobotConfig
+from lerobot.utils.motion_executor import interpolate_se3
 from lerobot.utils.utils import init_logging
 
 logger = logging.getLogger(__name__)
@@ -116,14 +118,22 @@ class GazeEngineConfig:
     preposition_max_ang_vel_deg_s: float = 80.0
     # PREPOSITION wants the camera pointed AT the object (look-at), so we want
     # orientation to matter more here than during APPROACHING.
-    preposition_ik_orientation_weight: float = 1.5
-    # If False, do not add gaze Δpan/Δtilt on top of preposition IK (they fight
-    # look-at and often prevent pos_err from shrinking). Gaze resumes in APPROACHING.
+    # Look-at orientation during orbit IK. Keep low (0–0.1) so the solver moves
+    # shoulder/elbow together; high values let the wrist satisfy rotation alone.
+    preposition_ik_orientation_weight: float = 0.0
+    # If False, skip orbit PREPOSITIONING on lock; go straight to depth APPROACHING
+    # (continuous whole-arm servo). Orbit still available via live ``p`` / keys.
+    preposition_use_orbit: bool = False
+    # If False, do not add gaze Δpan/Δtilt on top of preposition IK.
     preposition_apply_gaze: bool = False
-    # During PREPOSITIONING, if bbox center error (px) is >= this threshold,
-    # **skip** preposition IK for that tick and apply **gaze only** so the target
-    # stays in view. Prevents the arm from diving while the object drifts off-center.
-    preposition_emergency_gaze_pixel_threshold_px: float = 48.0
+    # Legacy: emergency gaze disabled when preposition_apply_gaze is False and
+    # fine_gaze_depth_err_m gates all gaze (see below).
+    preposition_emergency_gaze_pixel_threshold_px: float = 9999.0
+    preposition_emergency_ik_orientation_weight: float = 0.0
+    # If orbit IK does not converge within this time, proceed to APPROACHING anyway.
+    preposition_stuck_approach_s: float = 6.0
+    # On entering PREPOSITIONING, set orbit radius from current bbox depth (clamped).
+    preposition_sync_radius_to_depth: bool = True
     # If True, SEARCH goes straight to PREPOSITIONING after lock. If False
     # (default), SEARCH→TRACKING first so gaze centers the target before any
     # large orbit IK (much safer for eye-in-hand).
@@ -157,24 +167,73 @@ class GazeEngineConfig:
     # producing big joint jumps for a 1 mm Cartesian step — which throws the
     # bbox off-frame and forces APPROACHING→TRACKING regression. The cap
     # clips |Δq_i| regardless of what the solver proposes. Set to 0 to disable.
-    approach_max_joint_step_deg: float = 1.5
+    approach_max_joint_step_deg: float = 3.0
     # If True, APPROACH moves the EE along the **radial** vector from current
     # eye position toward the back-projected object point (not just along the
     # camera's optical axis). Keeps the trajectory directed at the actual
     # target even when look-at orientation is imperfect — eliminates the
     # "dive into floor" failure mode when T_ee_cam is mis-calibrated.
     approach_use_radial_to_object: bool = True
+    # Set to 0 to disable. Non-zero was an experiment; original always used radial.
+    approach_optical_only_depth_m: float = 0.0
+    approach_steep_camera_down_dot: float = 0.88
     # Soft visibility regulator. When pixel error exceeds this, the depth step
     # is scaled smoothly toward 0 (rather than waiting for the hard regress
     # threshold). 1.0 means no slowdown. Linear ramp between soft and regress.
-    approach_fov_soft_threshold_px: float = 35.0
+    approach_fov_soft_threshold_px: float = 50.0
+    # Top-down: slow approach using horizontal error only (not vertical parallax).
+    approach_fov_use_pan_err_px: bool = True
+    approach_fov_min_scale: float = 0.22
+    # Steep camera + large vertical bbox error: slide along view axis, not radial to floor point.
+    approach_steep_vertical_optical_px: float = 55.0
+    # When farther than this from goal depth, scale up approach linear velocity.
+    approach_depth_boost_err_m: float = 0.05
+    approach_depth_boost_lin_scale: float = 2.0
+    # If True, ignore pixel-error slowdown while still far in depth (faster but can
+    # drift off bbox). Default False = original visibility regulator at all ranges.
+    approach_depth_priority: bool = False
+    # While depth_err is above this, do not slow approach for pan misalignment.
+    approach_depth_priority_min_err_m: float = 0.055
+    # Minimum fraction of remaining depth error closed per tick (capped by max speed).
+    approach_depth_min_fraction_per_tick: float = 0.22
+    # Fuse OAK-D stereo ROI depth with bbox pinhole depth for approach.
+    approach_use_stereo_depth: bool = True
+    # When both exist, use max() so a shrinking bbox does not fake "too close" and retreat.
+    approach_depth_pessimistic_fusion: bool = True
+    # Only step backward if farther than standoff by at least this much (m).
+    approach_retreat_min_err_m: float = 0.028
+    # Cap how much filtered depth can increase per tick while APPROACHING (m).
+    approach_depth_max_increase_per_tick_m: float = 0.010
+    # Below this bbox depth (m), trust pinhole size only — stereo hits the table.
+    approach_bbox_only_depth_max_m: float = 0.22
+    # Reject stereo if it disagrees with bbox by more than this factor.
+    approach_stereo_bbox_max_ratio: float = 1.35
+    approach_stereo_bbox_min_ratio: float = 0.55
+    # Pause forward translation only when already near standoff *and* off-center.
+    approach_pause_depth_max_m: float = 0.20
+    approach_pause_pixel_err_px: float = 55.0
+    # Still move in if farther than this from goal depth (avoids gaze-only curl at ~15 cm).
+    approach_pause_max_depth_err_m: float = 0.048
+    # Do not declare approach done on depth alone — bbox must be reasonably centered.
+    approach_require_centered_for_done: bool = True
+    # Large pan error during coarse approach → re-run j1 PAN_ALIGN.
+    approach_regress_to_pan_align: bool = False
+    approach_regress_to_pan_align_px: float = 58.0
+    approach_regress_to_pan_align_frames: int = 10
+    approach_regress_to_pan_align_cooldown_s: float = 2.5
+    # EMA on bbox center during APPROACHING (lower = smoother, less bbox twitch).
+    approach_gaze_uv_ema_alpha: float = 0.22
+    # Reject bbox-center jumps larger than this (px/tick) — YOLO flicker.
+    gaze_uv_max_step_px: float = 45.0
 
     # Gaze (P-control on pixel error → joint deltas, no IK)
-    gaze_kp_pan: float = 0.45
-    gaze_kp_tilt: float = 0.35
-    gaze_max_step_pan_deg: float = 3.0
-    gaze_max_step_tilt_deg: float = 3.0
-    gaze_deadband_px: float = 6.0
+    gaze_kp_pan: float = 0.32
+    gaze_kp_tilt: float = 0.22
+    gaze_max_step_pan_deg: float = 1.8
+    gaze_max_step_tilt_deg: float = 1.4
+    gaze_deadband_px: float = 10.0
+    # EMA on bbox center before gaze (reduces wrist/pan jitter from detector noise).
+    gaze_uv_ema_alpha: float = 0.35
     pan_sign: float = 1.0
     wrist_tilt_sign: float = 1.0
     # When bbox is already near the image center, scale down shoulder_pan gaze so
@@ -182,6 +241,25 @@ class GazeEngineConfig:
     # via preposition IK, not endless left–right pan.
     gaze_pan_scale_when_aligned: float = 0.35
     gaze_pan_scale_aligned_enabled: bool = True
+    # During APPROACHING (only when depth is already near goal), scale gaze.
+    gaze_scale_during_approach: float = 1.0
+    gaze_tilt_scale_during_approach: float = 1.0
+    gaze_pan_scale_during_close_approach: float = 1.0
+    # PREPOSITION: wrist tilt only (shoulder_pan would fight orbit IK).
+    gaze_scale_during_preposition: float = 0.0
+    preposition_gaze_tilt_scale: float = 0.55
+    # Allow wrist tilt while the bbox is off-center vertically, even when far in depth.
+    coarse_gaze_tilt_pixel_err_px: float = 24.0
+    # Pixel centering (pan/tilt) only when |d_filt - standoff| is below this (m).
+    fine_gaze_depth_err_m: float = 0.045
+    # Coarse approach: whole-arm look-at IK toward the back-projected object
+    # (keeps the bbox in view; position-only IK leaves the camera pointing at
+    # the floor while the arm translates).
+    approach_coarse_look_at: bool = True
+    approach_coarse_ik_orientation_weight: float = 0.45
+    approach_coarse_max_ang_vel_deg_s: float = 45.0
+    # While SEARCH is sweeping, nudge pan/wrist toward a live detection.
+    search_detection_gaze_scale: float = 0.65
 
     # Live tuning (stdin and/or append-only file). Each non-empty line is a command.
     # Stdin: enable with ``live_control_stdin=True`` (type lines + Enter in the same
@@ -217,31 +295,69 @@ class GazeEngineConfig:
     live_el_max_deg: float = 135.0
     live_radius_step_m_default: float = 0.03
     live_standoff_step_m_default: float = 0.01
-    # ``-`` / ``=`` keys: composite "closeness" — adjusts both orbit radius and
-    # final standoff by this much each press, so motion is visible in any state.
+    # Legacy alias (stdin ``closeness`` command); keypress uses separate radius/standoff.
     live_closeness_step_m_default: float = 0.03
-    # Key-repeat coalescing: at most this many logical steps per control tick
-    # (comma/period/el/etc.), so holding a key nudges smoothly instead of
-    # jumping the orbit target to the clamp in one frame.
-    live_key_max_steps_per_tick: int = 2
+    # Key-repeat coalescing: at most this many logical steps per control tick.
     # Orbit radius/el used by IK slew toward the live target at this rate.
     live_radius_slew_m_s: float = 0.18
     live_standoff_slew_m_s: float = 0.04
-    live_el_slew_deg_s: float = 45.0
+    live_el_slew_deg_s: float = 32.0
     live_approach_boost_lin_vel_m_s: float = 0.06
     live_approach_boost_fov_scale_min: float = 0.85
     # Briefly raise preposition speed after a live key so motion keeps up with
     # the target (avoids "nothing… then jump").
     live_preposition_boost_duration_s: float = 0.55
+    live_orbit_boost_duration_s: float = 1.25
     live_preposition_boost_lin_vel_m_s: float = 0.14
     live_preposition_boost_joint_step_deg: float = 9.0
+    live_preposition_boost_ang_vel_deg_s: float = 120.0
+    # During live [ ] , . - = : use look-at orientation like the original orbit tune.
+    live_preposition_ik_orientation_weight: float = 1.2
+    # If True, step toward full orbit pose each tick (can feel jumpy); else rate-limited.
+    live_preposition_snap_se3: bool = False
+    # When snap_se3: max fraction of pose gap closed per tick (0.25–0.5 = smooth).
+    live_preposition_snap_alpha_max: float = 0.32
+    # Keypress: jump el/radius/standoff targets immediately; False = slew toward target.
+    live_keys_snap_targets: bool = False
+    live_key_max_steps_per_tick: int = 2
 
     # State machine
     lock_required_frames: int = 4
     track_lost_frames: int = 12
-    approach_pixel_threshold_px: float = 35.0
-    approach_consecutive_centered_frames: int = 3
-    approach_regress_pixel_threshold_px: float = 70.0
+    approach_pixel_threshold_px: float = 40.0
+    approach_consecutive_centered_frames: int = 2
+    approach_regress_pixel_threshold_px: float = 85.0
+    # If still far in depth, allow APPROACHING with a looser centering gate.
+    approach_depth_bypass_enabled: bool = True
+    approach_depth_bypass_err_m: float = 0.07
+    approach_depth_bypass_pixel_threshold_px: float = 52.0
+    # After lock, jump to orbit IK when bbox depth is this far past goal standoff.
+    preposition_on_lock_depth_err_m: float = 0.09
+    # If TRACKING cannot center for this long while still far, auto PREPOSITION.
+    tracking_stuck_preposition_s: float = 5.0
+    # Require shoulder_pan (j1) to center the target in u before orbit/approach IK.
+    require_pan_align: bool = True
+    pan_align_threshold_px: float = 28.0
+    pan_align_consecutive_frames: int = 4
+    pan_align_kp_pan: float = 0.55
+    pan_align_max_step_pan_deg: float = 2.8
+    # Above this |u−cx|, use faster j1 steps and wrist tilt (not j1-only).
+    pan_align_coarse_pan_err_px: float = 50.0
+    pan_align_coarse_max_step_pan_deg: float = 5.0
+    pan_align_coarse_allow_tilt: bool = True
+    # If the target drifts off-center in u during coarse approach, pause IK and re-pan.
+    pan_align_gate_approach: bool = True
+    # After lock, always PAN_ALIGN before APPROACHING (do not skip if u is momentarily ok).
+    pan_align_always_on_lock: bool = True
+    # Brief YOLO dropouts during approach: keep last bbox for IK/gaze (frames).
+    detection_hold_frames: int = 10
+    # Do not drop to TRACKING on large pixel_err while still far (avoids bbox flicker loop).
+    approach_regress_to_tracking: bool = False
+    # Scale down approach IK speed when pan is not yet centered.
+    approach_slowdown_pan_err_px: float = 35.0
+    approach_slowdown_lin_scale: float = 0.35
+    # Motor read failures before exiting the loop (comm glitches).
+    comm_error_max_consecutive: int = 25
 
     # Depth filtering (EMA on bbox-size pinhole depth)
     depth_ema_alpha: float = 0.35
@@ -314,11 +430,18 @@ def _init_live_runtime(cfg: GazeEngineConfig) -> dict:
         "lift_trim_deg": 0.0,
         "_file_offset": 0,
         "_goto_preposition": False,
+        "_goto_approaching": False,
         "_boost_until": 0.0,
         "_orbit_live_until": 0.0,
+        "_approach_live_until": 0.0,
         "_kb_buf": b"",
         "_termios_old": None,
         "_stdin_keypress": False,
+        "_uv_filt": None,
+        "_tracking_enter_t": None,
+        "_preposition_enter_t": None,
+        "_held_det": None,
+        "_det_hold_used": 0,
     }
 
 
@@ -345,19 +468,60 @@ def _live_delta_lift_trim(live: dict, cfg: GazeEngineConfig, signed_step: float)
     )
 
 
-def _live_arm_motion_boost(live: dict, cfg: GazeEngineConfig) -> None:
+def _live_arm_motion_boost(
+    live: dict,
+    cfg: GazeEngineConfig,
+    *,
+    approach: bool = False,
+    orbit: bool = False,
+) -> None:
     dur = float(getattr(cfg, "live_preposition_boost_duration_s", 0.55))
+    if orbit and not approach:
+        dur = max(dur, float(getattr(cfg, "live_orbit_boost_duration_s", 1.25)))
     now = time.time()
     live["_boost_until"] = max(float(live.get("_boost_until", 0.0)), now + dur)
-    # Orbit keys must run look-at IK even when bbox is off-center (emergency gaze
-    # would otherwise block IK whenever pixel_err > threshold).
+    if orbit:
+        live["_preposition_stuck_pause_until"] = max(
+            float(live.get("_preposition_stuck_pause_until", 0.0)), now + dur
+        )
+        live["_preposition_enter_t"] = None
     live["_orbit_live_until"] = max(
         float(live.get("_orbit_live_until", 0.0)), now + dur
     )
+    if approach:
+        live["_approach_live_until"] = max(
+            float(live.get("_approach_live_until", 0.0)), now + dur
+        )
 
 
 def _live_orbit_keys_active(live: dict, loop_t: float) -> bool:
     return loop_t < float(live.get("_orbit_live_until", 0.0))
+
+
+def _live_approach_keys_active(live: dict, loop_t: float) -> bool:
+    return loop_t < float(live.get("_approach_live_until", 0.0))
+
+
+def _live_motion_override_active(live: dict, loop_t: float) -> bool:
+    """User pressed a live key recently — bypass pan-only gate so IK actually moves."""
+    return _live_orbit_keys_active(live, loop_t) or _live_approach_keys_active(
+        live, loop_t
+    )
+
+
+def _live_snap_el(live: dict, el_deg: float) -> None:
+    live["el"] = float(el_deg)
+    live["el_target"] = float(el_deg)
+
+
+def _live_snap_radius(live: dict, radius_m: float) -> None:
+    live["radius"] = float(radius_m)
+    live["radius_target"] = float(radius_m)
+
+
+def _live_snap_standoff(live: dict, standoff_m: float) -> None:
+    live["standoff"] = float(standoff_m)
+    live["standoff_target"] = float(standoff_m)
 
 
 def _live_slew_orbit_targets(live: dict, cfg: GazeEngineConfig, dt: float) -> None:
@@ -392,21 +556,27 @@ def _live_delta_el_deg(live: dict, cfg: GazeEngineConfig, signed_step: float) ->
     cur = float(live.get("el_target", live["el"]))
     new_el = float(np.clip(cur + float(signed_step), lo, hi))
     if abs(new_el - cur) < 1e-6:
-        logger.info(
-            "[gaze-live] approach_el_deg=%.1f° (clamped at %s%.0f°, widen with "
-            "--live-el-min-deg/--live-el-max-deg)",
-            new_el,
-            "+" if signed_step > 0 else "",
-            hi if signed_step > 0 else lo,
-        )
+        now = time.time()
+        if now - float(live.get("_el_clamp_log_t", 0.0)) > 0.6:
+            live["_el_clamp_log_t"] = now
+            logger.info(
+                "[gaze-live] approach_el_deg=%.1f° (clamped at %s%.0f°, widen with "
+                "--live-el-min-deg/--live-el-max-deg)",
+                new_el,
+                "+" if signed_step > 0 else "",
+                hi if signed_step > 0 else lo,
+            )
         return
     live["el_target"] = new_el
-    _live_arm_motion_boost(live, cfg)
+    if bool(getattr(cfg, "live_keys_snap_targets", True)):
+        _live_snap_el(live, new_el)
+    _live_arm_motion_boost(live, cfg, orbit=True)
     live["_goto_preposition"] = True
     logger.info(
-        "[gaze-live] approach_el_deg → %.1f° (%+.1f°, slewing) PREPOSITION",
+        "[gaze-live] approach_el_deg → %.1f° (%+.1f°, %s) PREPOSITION",
         new_el,
         float(signed_step),
+        "snap" if bool(getattr(cfg, "live_keys_snap_targets", True)) else "slewing",
     )
 
 
@@ -416,12 +586,15 @@ def _live_delta_radius_m(live: dict, cfg: GazeEngineConfig, signed_step: float) 
     if abs(new_r - cur) < 1e-6:
         return
     live["radius_target"] = new_r
-    _live_arm_motion_boost(live, cfg)
+    if bool(getattr(cfg, "live_keys_snap_targets", True)):
+        _live_snap_radius(live, new_r)
+    _live_arm_motion_boost(live, cfg, orbit=True)
     live["_goto_preposition"] = True
     logger.info(
-        "[gaze-live] orbit radius → %.3fm (%+.3fm, slewing) PREPOSITION",
+        "[gaze-live] orbit radius → %.3fm (%+.3fm, %s) PREPOSITION",
         new_r,
         float(signed_step),
+        "snap" if bool(getattr(cfg, "live_keys_snap_targets", True)) else "slewing",
     )
 
 
@@ -431,11 +604,15 @@ def _live_delta_standoff_m(live: dict, cfg: GazeEngineConfig, signed_step: float
     if abs(new_s - cur) < 1e-6:
         return
     live["standoff_target"] = new_s
-    _live_arm_motion_boost(live, cfg)
+    if bool(getattr(cfg, "live_keys_snap_targets", True)):
+        _live_snap_standoff(live, new_s)
+    _live_arm_motion_boost(live, cfg, approach=True)
+    live["_goto_approaching"] = True
     logger.info(
-        "[gaze-live] goal depth (standoff) → %.3fm (%+.3fm, slewing)",
+        "[gaze-live] goal depth (standoff) → %.3fm (%+.3fm, %s) APPROACHING",
         new_s,
         float(signed_step),
+        "snap" if bool(getattr(cfg, "live_keys_snap_targets", True)) else "slewing",
     )
 
 
@@ -483,7 +660,8 @@ def _apply_live_line(raw: str, cfg: GazeEngineConfig, live: dict) -> None:
             v = max(0.02, float(_f(0)))
             live["standoff"] = v
             live["standoff_target"] = v
-            _live_arm_motion_boost(live, cfg)
+            _live_arm_motion_boost(live, cfg, approach=True)
+            live["_goto_approaching"] = True
             logger.info("[gaze-live] goal depth (standoff)=%.3fm", v)
         elif tok in ("radius", "r"):
             v = max(0.05, float(_f(0)))
@@ -632,19 +810,15 @@ def _drain_live_keypress(cfg: GazeEngineConfig, live: dict) -> None:
             net_el -= 1
         elif c == ord("]"):
             net_el += 1
-        # , / - = back (orbit radius +, goal depth +); . / = in (both −)
+        # , . = orbit radius; - / = = radius 2× (standoff: stdin ``depth`` only)
         elif c == ord(","):
             net_rad += 1
-            net_standoff += 1
         elif c == ord("."):
             net_rad -= 1
-            net_standoff -= 1
         elif c in (ord("-"), ord("_")):
             net_rad += 2
-            net_standoff += 2
         elif c in (ord("="), ord("+")):
             net_rad -= 2
-            net_standoff -= 2
         elif c == ord("p"):
             want_preposition = True
         elif c == ord("?"):
@@ -669,12 +843,13 @@ def _drain_live_keypress(cfg: GazeEngineConfig, live: dict) -> None:
     if ce != 0:
         _live_delta_el_deg(live, cfg, float(ce) * el_step)
     if want_preposition:
+        _live_arm_motion_boost(live, cfg, orbit=True)
         live["_goto_preposition"] = True
         logger.info("[gaze-live] PREPOSITION requested (key 'p')")
     if want_help:
         logger.info(
-            "[gaze-live] keys: [ ]/↑↓=el ; ,/-=back (orbit+goal depth) ; ./=in ; "
-            "max %d/tick ; p=preposition ; ? = help",
+            "[gaze-live] keys: [ ]/↑↓=el ; ,.=radius ; -=back +=in (2×) ; "
+            "depth via stdin ; max %d/tick ; p=preposition ; ? = help",
             max_steps,
         )
 
@@ -786,6 +961,382 @@ def _gaze_joint_deltas(
     return d_pan, d_tilt, err_px
 
 
+def _pan_horizontal_err_px(uv: tuple[float, float], cx0: float) -> float:
+    return abs(float(uv[0]) - float(cx0))
+
+
+def _is_pan_aligned(uv: tuple[float, float], cx0: float, cfg: GazeEngineConfig) -> bool:
+    return _pan_horizontal_err_px(uv, cx0) < float(
+        getattr(cfg, "pan_align_threshold_px", 28.0)
+    )
+
+
+def _gaze_pan_only_delta(
+    *,
+    uv: tuple[float, float],
+    cx0: float,
+    fx: float,
+    cfg: GazeEngineConfig,
+    pan_err_px: float | None = None,
+) -> float:
+    """Shoulder_pan (j1) only — used before whole-arm approach IK."""
+    du = float(uv[0]) - float(cx0)
+    if abs(du) <= float(cfg.gaze_deadband_px):
+        return 0.0
+    d_pan_deg = math.degrees(math.atan2(du, max(1e-6, float(fx))))
+    kp = float(getattr(cfg, "pan_align_kp_pan", 0.55))
+    cap = float(getattr(cfg, "pan_align_max_step_pan_deg", 2.8))
+    coarse_px = float(getattr(cfg, "pan_align_coarse_pan_err_px", 50.0))
+    if pan_err_px is not None and float(pan_err_px) > coarse_px:
+        cap = float(getattr(cfg, "pan_align_coarse_max_step_pan_deg", 5.0))
+    return float(
+        np.clip(
+            float(cfg.pan_sign) * kp * d_pan_deg,
+            -cap,
+            +cap,
+        )
+    )
+
+
+def _pan_align_required(cfg: GazeEngineConfig) -> bool:
+    return bool(getattr(cfg, "require_pan_align", True))
+
+
+def _states_hold_detection() -> tuple[str, ...]:
+    return ("PAN_ALIGN", "APPROACHING", "PREPOSITIONING", "HOLD", "TRACKING")
+
+
+def _apply_detection_hold(
+    *,
+    detected: bool,
+    bbox_xyxy: tuple[float, float, float, float] | None,
+    uv: tuple[float, float] | None,
+    conf: float,
+    state: str,
+    live: dict,
+    cfg: GazeEngineConfig,
+) -> tuple[bool, tuple[float, float, float, float] | None, tuple[float, float] | None, float]:
+    """Reuse last good detection for a few frames so approach IK does not stutter."""
+    hold_n = max(0, int(getattr(cfg, "detection_hold_frames", 10)))
+    if detected and bbox_xyxy is not None and uv is not None:
+        live["_held_det"] = {
+            "bbox": tuple(bbox_xyxy),
+            "uv": (float(uv[0]), float(uv[1])),
+            "conf": float(conf),
+        }
+        live["_det_hold_used"] = 0
+        return True, bbox_xyxy, uv, float(conf)
+
+    if (
+        hold_n > 0
+        and state in _states_hold_detection()
+        and live.get("_held_det") is not None
+        and int(live.get("_det_hold_used", 0)) < hold_n
+    ):
+        h = live["_held_det"]
+        live["_det_hold_used"] = int(live.get("_det_hold_used", 0)) + 1
+        return (
+            True,
+            tuple(h["bbox"]),
+            (float(h["uv"][0]), float(h["uv"][1])),
+            float(h["conf"]),
+        )
+    live["_det_hold_used"] = 0
+    return False, None, None, 0.0
+
+
+def _filter_bbox_uv(
+    live: dict,
+    uv: tuple[float, float],
+    cfg: GazeEngineConfig,
+    *,
+    state: str = "",
+) -> tuple[float, float]:
+    if state == "APPROACHING":
+        alpha = float(
+            np.clip(
+                float(getattr(cfg, "approach_gaze_uv_ema_alpha", 0.22)),
+                0.05,
+                1.0,
+            )
+        )
+    else:
+        alpha = float(
+            np.clip(float(getattr(cfg, "gaze_uv_ema_alpha", 0.35)), 0.05, 1.0)
+        )
+    prev = live.get("_uv_filt")
+    u_in, v_in = float(uv[0]), float(uv[1])
+    if prev is not None and state not in ("PAN_ALIGN", "SEARCH", "APPROACHING"):
+        jump = float(
+            math.hypot(u_in - float(prev[0]), v_in - float(prev[1]))
+        )
+        if jump > float(getattr(cfg, "gaze_uv_max_step_px", 45.0)):
+            u_in, v_in = float(prev[0]), float(prev[1])
+    if prev is None:
+        live["_uv_filt"] = (u_in, v_in)
+    else:
+        live["_uv_filt"] = (
+            (1.0 - alpha) * float(prev[0]) + alpha * u_in,
+            (1.0 - alpha) * float(prev[1]) + alpha * v_in,
+        )
+    f = live["_uv_filt"]
+    return float(f[0]), float(f[1])
+
+
+def _should_pause_approach_forward(
+    *,
+    d_bbox: float | None,
+    pixel_err_px: float,
+    depth_err_m: float | None,
+    cfg: GazeEngineConfig,
+) -> bool:
+    """Pause translation only when near goal depth and off-center — not at ~15 cm."""
+    if d_bbox is None:
+        return False
+    if float(pixel_err_px) <= float(
+        getattr(cfg, "approach_pause_pixel_err_px", 55.0)
+    ):
+        return False
+    if float(d_bbox) > float(getattr(cfg, "approach_pause_depth_max_m", 0.20)):
+        return False
+    if depth_err_m is not None and float(depth_err_m) > float(
+        getattr(cfg, "approach_pause_max_depth_err_m", 0.048)
+    ):
+        return False
+    return True
+
+
+def _depth_err_m(d_filt: float | None, standoff_m: float) -> float | None:
+    if d_filt is None:
+        return None
+    return float(d_filt) - float(standoff_m)
+
+
+def _measure_object_depth_m(
+    *,
+    depth_map: np.ndarray | None,
+    bbox_xyxy: tuple[float, float, float, float],
+    fx: float,
+    fy: float,
+    cfg: GazeEngineConfig,
+    depth_scale: float,
+) -> tuple[float | None, float | None, float | None]:
+    """Return ``(d_fused, d_bbox, d_stereo)``. Fused depth is pessimistic (farther) when enabled."""
+    d_bbox = depth_from_bbox_size(
+        bbox_xyxy,
+        fx=float(fx),
+        fy=float(fy),
+        target_physical_size_m=float(cfg.target_physical_size_m),
+    )
+    if d_bbox is not None:
+        sc = float(np.clip(float(cfg.bbox_depth_scale), 0.25, 4.0))
+        off = float(getattr(cfg, "bbox_depth_offset_m", 0.0))
+        d_bbox = max(0.005, float(d_bbox) * sc + off)
+
+    d_stereo: float | None = None
+    if bool(getattr(cfg, "approach_use_stereo_depth", True)) and depth_map is not None:
+        try:
+            d_stereo = median_depth_m(
+                np.asarray(depth_map),
+                bbox_xyxy,
+                depth_scale=float(depth_scale),
+                min_mm=50.0,
+                max_mm=3500.0,
+            )
+        except Exception:
+            d_stereo = None
+
+    close_max = float(getattr(cfg, "approach_bbox_only_depth_max_m", 0.22))
+    if d_bbox is not None and float(d_bbox) < close_max:
+        return float(d_bbox), d_bbox, d_stereo
+
+    if d_stereo is not None and d_bbox is not None:
+        ratio = float(d_stereo) / max(float(d_bbox), 1e-3)
+        r_max = float(getattr(cfg, "approach_stereo_bbox_max_ratio", 1.35))
+        r_min = float(getattr(cfg, "approach_stereo_bbox_min_ratio", 0.55))
+        if ratio > r_max or ratio < r_min:
+            d_fused = float(d_bbox)
+        elif bool(getattr(cfg, "approach_depth_pessimistic_fusion", True)):
+            d_fused = max(float(d_stereo), float(d_bbox))
+        else:
+            d_fused = 0.5 * float(d_stereo) + 0.5 * float(d_bbox)
+    else:
+        d_fused = d_stereo if d_stereo is not None else d_bbox
+    return d_fused, d_bbox, d_stereo
+
+
+def _filter_approach_depth(
+    live: dict,
+    d_meas: float,
+    *,
+    state: str,
+    cfg: GazeEngineConfig,
+    alpha: float,
+    d_filt_prev: float | None,
+) -> float:
+    """EMA depth with monotonic guard while APPROACHING (bbox shrink must not trigger retreat)."""
+    dm = float(d_meas)
+    if state != "APPROACHING":
+        live.pop("_d_approach_min", None)
+        if d_filt_prev is None:
+            return dm
+        return float((1.0 - alpha) * d_filt_prev + alpha * dm)
+
+    prev_min = live.get("_d_approach_min")
+    max_up = float(getattr(cfg, "approach_depth_max_increase_per_tick_m", 0.010))
+    if prev_min is None:
+        live["_d_approach_min"] = dm
+    else:
+        pm = float(prev_min)
+        if dm < pm:
+            live["_d_approach_min"] = dm
+        dm = min(dm, pm + max_up)
+
+    if d_filt_prev is None:
+        return dm
+    return float((1.0 - alpha) * d_filt_prev + alpha * dm)
+
+
+def _reset_approach_depth_filter(live: dict, *, d_bbox: float | None = None) -> None:
+    live.pop("_d_approach_min", None)
+    if d_bbox is not None:
+        live["_d_approach_reseed"] = float(d_bbox)
+
+
+def _depth_for_geometry(
+    d_filt: float | None, d_bbox: float | None, cfg: GazeEngineConfig
+) -> float | None:
+    """Depth used for back-projection / IK (stable close-range bbox, else filtered)."""
+    if d_bbox is not None and float(d_bbox) < float(
+        getattr(cfg, "approach_bbox_only_depth_max_m", 0.22)
+    ):
+        return float(d_bbox)
+    return d_filt
+
+
+def _sync_preposition_radius_to_depth(
+    live: dict, cfg: GazeEngineConfig, d_filt: float | None
+) -> None:
+    """Set orbit radius near current camera range so IK target is reachable."""
+    if d_filt is None:
+        return
+    stand = float(live["standoff"])
+    r = float(
+        np.clip(
+            float(d_filt),
+            stand + 0.04,
+            float(getattr(cfg, "preposition_initial_radius_m", 0.2)) + 0.15,
+        )
+    )
+    live["radius"] = r
+    live["radius_target"] = r
+
+
+def _gaze_allow_pan(
+    *,
+    state: str,
+    depth_err_m: float | None,
+    cfg: GazeEngineConfig,
+    pan_aligned: bool,
+) -> bool:
+    """When False, zero shoulder_pan gaze (orbit IK handles pan in PREPOSITION)."""
+    if state == "PAN_ALIGN":
+        return True
+    if state == "SEARCH":
+        return False
+    if state == "PREPOSITIONING":
+        return bool(cfg.preposition_apply_gaze)
+    if state in ("APPROACHING", "TRACKING", "HOLD"):
+        return True
+    return False
+
+
+def _camera_steep_top_down(T_base_cam: np.ndarray, cfg: GazeEngineConfig) -> bool:
+    z_ax = np.asarray(T_base_cam[:3, 2], dtype=np.float64)
+    zn = float(np.linalg.norm(z_ax))
+    if zn < 1e-9:
+        return False
+    return abs(float(z_ax[2] / zn)) >= float(
+        getattr(cfg, "approach_steep_camera_down_dot", 0.88)
+    )
+
+
+def _approach_fov_regulator_px(
+    *,
+    pixel_err_px: float,
+    pan_err_px: float,
+    T_base_cam_cur: np.ndarray,
+    cfg: GazeEngineConfig,
+) -> float:
+    """Pixel error used to throttle forward speed (not full 2D when top-down)."""
+    if bool(getattr(cfg, "approach_fov_use_pan_err_px", True)) and _camera_steep_top_down(
+        T_base_cam_cur, cfg
+    ):
+        return float(pan_err_px)
+    return float(pixel_err_px)
+
+
+def _gaze_allow_tilt(
+    *,
+    state: str,
+    depth_err_m: float | None,
+    cfg: GazeEngineConfig,
+    pan_aligned: bool,
+    pixel_err_px: float,
+    vertical_err_px: float,
+) -> bool:
+    """Wrist tilt to center the bbox in v — allowed even when pan is gated off."""
+    if state == "PAN_ALIGN":
+        if not bool(getattr(cfg, "pan_align_coarse_allow_tilt", True)):
+            return False
+        v_thresh = float(getattr(cfg, "coarse_gaze_tilt_pixel_err_px", 24.0))
+        return abs(float(vertical_err_px)) > float(cfg.gaze_deadband_px) and (
+            abs(float(vertical_err_px)) >= v_thresh
+            or float(pixel_err_px) >= v_thresh
+        )
+    if state == "SEARCH":
+        return False
+    v_thresh = float(getattr(cfg, "coarse_gaze_tilt_pixel_err_px", 24.0))
+    if abs(float(vertical_err_px)) > float(cfg.gaze_deadband_px) and (
+        abs(float(vertical_err_px)) >= v_thresh
+        or float(pixel_err_px) >= v_thresh
+    ):
+        if state in ("APPROACHING", "PREPOSITIONING", "TRACKING", "HOLD"):
+            return True
+    if state == "PREPOSITIONING":
+        return bool(cfg.preposition_apply_gaze)
+    fine = float(getattr(cfg, "fine_gaze_depth_err_m", 0.045))
+    if depth_err_m is not None and float(depth_err_m) > fine:
+        return False
+    return state in ("TRACKING", "APPROACHING", "HOLD")
+
+
+def _use_orbit_preposition(cfg: GazeEngineConfig) -> bool:
+    return bool(cfg.preposition_enabled) and bool(
+        getattr(cfg, "preposition_use_orbit", False)
+    )
+
+
+def _approach_centering_ok(
+    *,
+    pixel_err_px: float,
+    depth_err_m: float | None,
+    cfg: GazeEngineConfig,
+) -> bool:
+    tight = float(cfg.approach_pixel_threshold_px)
+    if pixel_err_px < tight:
+        return True
+    if not bool(getattr(cfg, "approach_depth_bypass_enabled", True)):
+        return False
+    if depth_err_m is None:
+        return False
+    if float(depth_err_m) < float(getattr(cfg, "approach_depth_bypass_err_m", 0.07)):
+        return False
+    return pixel_err_px < float(
+        getattr(cfg, "approach_depth_bypass_pixel_threshold_px", 52.0)
+    )
+
+
 def _search_command(
     *,
     seed: np.ndarray,
@@ -872,6 +1423,9 @@ def _preposition_q(
     preposition_radius_m: float | None = None,
     max_lin_vel_m_s: float | None = None,
     max_joint_step_deg: float | None = None,
+    max_ang_vel_deg_s: float | None = None,
+    ik_orientation_weight: float | None = None,
+    snap_se3: bool = False,
 ) -> tuple[np.ndarray | None, np.ndarray, float]:
     """Drive EE toward the commanded vantage point on a sphere around the object.
 
@@ -902,20 +1456,34 @@ def _preposition_q(
         if max_lin_vel_m_s is not None
         else cfg.preposition_max_lin_vel_m_s
     )
-    T_step = _se3_rate_limited_step(
-        T_base_ee_cur,
-        T_target,
-        dt=float(dt),
-        max_lin_vel_m_s=lin_vel,
-        max_ang_vel_deg_s=float(cfg.preposition_max_ang_vel_deg_s),
+    ang_vel = float(
+        max_ang_vel_deg_s
+        if max_ang_vel_deg_s is not None
+        else cfg.preposition_max_ang_vel_deg_s
     )
+    if bool(snap_se3):
+        alpha_cap = float(
+            np.clip(
+                float(getattr(cfg, "live_preposition_snap_alpha_max", 0.32)), 0.05, 1.0
+            )
+        )
+        T_step = interpolate_se3(T_base_ee_cur, T_target, alpha_cap)
+    else:
+        T_step = _se3_rate_limited_step(
+            T_base_ee_cur,
+            T_target,
+            dt=float(dt),
+            max_lin_vel_m_s=lin_vel,
+            max_ang_vel_deg_s=ang_vel,
+        )
     pos_err = float(np.linalg.norm(T_base_ee_cur[:3, 3] - p_eye))
     q_new = None
-    for ow in (
-        float(cfg.preposition_ik_orientation_weight),
-        0.15,
-        0.0,
-    ):
+    ow_primary = float(
+        ik_orientation_weight
+        if ik_orientation_weight is not None
+        else cfg.preposition_ik_orientation_weight
+    )
+    for ow in (ow_primary, 0.15, 0.0):
         try:
             q_new = kin.inverse_kinematics(
                 joints_deg,
@@ -959,6 +1527,8 @@ def _approach_q(
     d_obj_m: float,
     p_obj_base: np.ndarray | None,
     pixel_err_px: float,
+    pan_err_px: float = 0.0,
+    vertical_err_px: float = 0.0,
     cfg: GazeEngineConfig,
     dt: float,
     kin,
@@ -966,64 +1536,105 @@ def _approach_q(
     max_lin_vel_m_s: float | None = None,
     max_joint_step_deg: float | None = None,
     fov_scale_min: float | None = None,
+    ik_orientation_weight: float | None = None,
+    coarse_approach: bool = False,
+    T_ee_cam: np.ndarray | None = None,
+    pause_forward: bool = False,
 ) -> tuple[np.ndarray | None, float, float]:
-    """Step the EE radially toward the object (or along the optical axis as
-    a fallback), with a soft visibility regulator that scales the depth step
-    by pixel error.
+    """Radial (or optical) step toward standoff + soft slowdown when bbox off-center.
 
-    Returns (q_new, planned_step_m, fov_scale). ``q_new`` is None on IK
-    failure. Radial mode keeps the trajectory directed at the actual
-    back-projected object point even when the camera look-at is imperfect —
-    that is what prevents the "dive into floor" failure mode.
+    Matches the original gaze-engine: IK slides toward the back-projected point,
+    joint gaze keeps tracking the bbox; ``fov_scale`` cuts forward speed when the
+    target drifts in the image (closer range = smaller errors = easier tracking).
     """
     eye_base = np.asarray(T_base_cam_cur[:3, 3], dtype=np.float64)
+    z_ax = np.asarray(T_base_cam_cur[:3, 2], dtype=np.float64)
+    zn = float(np.linalg.norm(z_ax))
+    if zn > 1e-9:
+        z_ax = z_ax / zn
+    v_lim = float(getattr(cfg, "approach_steep_vertical_optical_px", 55.0))
+    use_optical = _camera_steep_top_down(T_base_cam_cur, cfg) and abs(
+        float(vertical_err_px)
+    ) >= v_lim
     if (
-        bool(cfg.approach_use_radial_to_object)
+        not use_optical
+        and bool(cfg.approach_use_radial_to_object)
         and p_obj_base is not None
         and float(np.linalg.norm(np.asarray(p_obj_base) - eye_base)) > 1e-3
     ):
         radial = np.asarray(p_obj_base, dtype=np.float64) - eye_base
         direction = radial / float(np.linalg.norm(radial))
     else:
-        direction = np.asarray(T_base_cam_cur[:3, 2], dtype=np.float64)
+        direction = z_ax if zn > 1e-9 else np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
     d_target = float(
         final_standoff_m if final_standoff_m is not None else cfg.final_standoff_m
     )
     err = float(d_obj_m) - d_target
 
-    # Soft visibility regulator: smoothly cut depth velocity as pixel error
-    # approaches the hard regress threshold.
+    reg_px = _approach_fov_regulator_px(
+        pixel_err_px=float(pixel_err_px),
+        pan_err_px=float(pan_err_px),
+        T_base_cam_cur=T_base_cam_cur,
+        cfg=cfg,
+    )
     soft = float(cfg.approach_fov_soft_threshold_px)
     hard = float(cfg.approach_regress_pixel_threshold_px)
-    if pixel_err_px <= soft or hard <= soft:
+    if reg_px <= soft or hard <= soft:
         fov_scale = 1.0
     else:
-        fov_scale = max(0.0, 1.0 - (pixel_err_px - soft) / max(1e-3, hard - soft))
+        fov_scale = max(
+            0.0, 1.0 - (reg_px - soft) / max(1e-3, hard - soft)
+        )
+    fov_floor = float(getattr(cfg, "approach_fov_min_scale", 0.22))
+    fov_scale = max(float(fov_scale), fov_floor)
     if fov_scale_min is not None:
         fov_scale = max(float(fov_scale), float(fov_scale_min))
+    if bool(getattr(cfg, "approach_depth_priority", False)) and err > float(
+        getattr(cfg, "approach_depth_priority_min_err_m", 0.055)
+    ):
+        fov_scale = 1.0
 
     lin_vel = float(
         max_lin_vel_m_s
         if max_lin_vel_m_s is not None
         else cfg.approach_max_lin_vel_m_s
     )
+    boost_err = float(getattr(cfg, "approach_depth_boost_err_m", 0.05))
+    boost_scale = float(getattr(cfg, "approach_depth_boost_lin_scale", 2.0))
+    if err > boost_err and boost_scale > 1.0:
+        lin_vel *= boost_scale
     max_step = lin_vel * float(dt)
     raw = float(cfg.approach_kp) * err * float(fov_scale)
     step = float(np.clip(raw, -max_step, +max_step))
+    retreat_min = float(getattr(cfg, "approach_retreat_min_err_m", 0.028))
+    if step < 0.0 and err > -retreat_min:
+        step = 0.0
+    if (
+        bool(getattr(cfg, "approach_depth_priority", False))
+        and err > boost_err
+        and not bool(pause_forward)
+    ):
+        frac = float(getattr(cfg, "approach_depth_min_fraction_per_tick", 0.22))
+        step = max(step, min(float(err) * frac, max_step))
+    if bool(pause_forward):
+        step = 0.0
 
     T_target = np.asarray(T_base_ee_cur, dtype=np.float64).copy()
     T_target[:3, 3] = T_base_ee_cur[:3, 3] + direction * step
+    T_ik = T_target
+
     q_new = None
-    for ow in (
-        float(cfg.ik_orientation_weight),
-        0.15,
-        0.0,
-    ):
+    ow0 = float(
+        ik_orientation_weight
+        if ik_orientation_weight is not None
+        else cfg.ik_orientation_weight
+    )
+    for ow in (ow0, 0.15, 0.0):
         try:
             q_new = kin.inverse_kinematics(
                 joints_deg,
-                T_target,
+                T_ik,
                 position_weight=float(cfg.ik_position_weight),
                 orientation_weight=float(ow),
             )
@@ -1202,6 +1813,14 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
         "[gaze-engine] intrinsics fx=%.1f fy=%.1f cx=%.1f cy=%.1f", fx, fy, cx0, cy0
     )
     logger.info(
+        "[gaze-engine] approach: coarse_look_at=%s depth_priority=%s "
+        "regress_pan_align=%s (APPROACHING is radial+joint-gaze; "
+        "approach_el/az apply to PREPOSITION orbit only — use [ ] or p)",
+        bool(getattr(cfg, "approach_coarse_look_at", True)),
+        bool(getattr(cfg, "approach_depth_priority", True)),
+        bool(getattr(cfg, "approach_regress_to_pan_align", False)),
+    )
+    logger.info(
         "[gaze-engine] preposition=%s el=%.1f° bbox_depth_scale=%.3f "
         "preposition_apply_gaze=%s require_centered_bbox=%s "
         "preposition_from_search=%s emergency_gaze_px=%.0f ik_floor_z=%.3fm",
@@ -1226,9 +1845,11 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
 
     # State machine
     state = "SEARCH"
+    prev_state = "SEARCH"
     detection_streak = 0
     miss_streak = 0
     centered_streak = 0
+    pan_align_streak = 0
 
     # Depth EMA
     d_filt: float | None = None
@@ -1248,7 +1869,7 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
     )
     if want_keys and _install_stdin_keypress(live):
         logger.info(
-            "[gaze-live] keypress: [ ]/↑↓=el ; ,=back .=in ; -=back2x =in2x (orbit) ; "
+            "[gaze-live] keypress: [ ]/↑↓=el ; ,.=radius ; -=back +=in (2×) ; "
             "p=preposition ; ? = help",
         )
     elif want_keys:
@@ -1290,6 +1911,7 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
     except Exception as e:
         logger.warning("[gaze-engine] startup geometry log failed: %s", e)
 
+    comm_errors = 0
     try:
         while True:
             loop_t = time.time()
@@ -1297,7 +1919,22 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
             last_t = loop_t
             tick += 1
 
-            obs = robot.get_observation()
+            try:
+                obs = robot.get_observation()
+            except (ConnectionError, OSError, TimeoutError) as e:
+                comm_errors += 1
+                logger.warning(
+                    "[gaze-engine] robot read failed (%d/%d): %s",
+                    comm_errors,
+                    int(getattr(cfg, "comm_error_max_consecutive", 25)),
+                    e,
+                )
+                if comm_errors >= int(getattr(cfg, "comm_error_max_consecutive", 25)):
+                    raise
+                _sleep(loop_t, dt_target)
+                continue
+            comm_errors = 0
+
             rgb = obs.get(cfg.camera_key)
             depth = obs.get(f"{cfg.camera_key}_depth")
             if rgb is None:
@@ -1346,30 +1983,45 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     )
 
             detected = bbox_xyxy is not None and uv is not None
+            detected, bbox_xyxy, uv, conf = _apply_detection_hold(
+                detected=detected,
+                bbox_xyxy=bbox_xyxy,
+                uv=uv,
+                conf=conf,
+                state=state,
+                live=live,
+                cfg=cfg,
+            )
 
             if detected and state != "SEARCH" and uv is not None:
                 lock_uv = (float(uv[0]), float(uv[1]))
                 lock_joints = np.asarray(joints, dtype=np.float64).copy()
 
-            # Bbox-size pinhole depth (the depth signal we trust at close range)
             d_bbox: float | None = None
-            if detected:
-                d_bbox = depth_from_bbox_size(
-                    bbox_xyxy,
+            d_stereo: float | None = None
+            if detected and bbox_xyxy is not None:
+                d_meas, d_bbox, d_stereo = _measure_object_depth_m(
+                    depth_map=depth,
+                    bbox_xyxy=bbox_xyxy,
                     fx=fx,
                     fy=fy,
-                    target_physical_size_m=float(cfg.target_physical_size_m),
+                    cfg=cfg,
+                    depth_scale=float(intrinsics.get("depth_scale", 0.001)),
                 )
-                if d_bbox is not None:
-                    sc = float(np.clip(float(cfg.bbox_depth_scale), 0.25, 4.0))
-                    off = float(getattr(cfg, "bbox_depth_offset_m", 0.0))
-                    d_bbox = max(0.005, float(d_bbox) * sc + off)
-                    alpha = float(cfg.depth_ema_alpha)
-                    d_filt = (
-                        float(d_bbox)
-                        if d_filt is None
-                        else (1.0 - alpha) * d_filt + alpha * float(d_bbox)
-                    )
+                if d_meas is not None:
+                    reseed_d = live.pop("_d_approach_reseed", None)
+                    if reseed_d is not None:
+                        d_filt = float(reseed_d)
+                    else:
+                        alpha = float(cfg.depth_ema_alpha)
+                        d_filt = _filter_approach_depth(
+                            live,
+                            float(d_meas),
+                            state=state,
+                            cfg=cfg,
+                            alpha=alpha,
+                            d_filt_prev=d_filt,
+                        )
 
             _drain_live_commands(cfg, live)
             _live_slew_orbit_targets(live, cfg, dt)
@@ -1381,7 +2033,26 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                         logger.info("[gaze-engine] LIVE→PREPOSITIONING (user command)")
                     state = "PREPOSITIONING"
                     centered_streak = 0
+                    live["_preposition_enter_t"] = float(loop_t)
+                    if bool(getattr(cfg, "preposition_sync_radius_to_depth", True)):
+                        _sync_preposition_radius_to_depth(live, cfg, d_filt)
                     live["_goto_preposition"] = False
+            if live.get("_goto_approaching", False):
+                live["_goto_approaching"] = False
+                if detected and state in (
+                    "PREPOSITIONING",
+                    "TRACKING",
+                    "PAN_ALIGN",
+                    "HOLD",
+                ):
+                    if state != "APPROACHING":
+                        logger.info(
+                            "[gaze-engine] LIVE→APPROACHING (standoff / depth key)"
+                        )
+                    state = "APPROACHING"
+                    centered_streak = 0
+                    live["_tracking_enter_t"] = None
+                    live["_preposition_enter_t"] = None
 
             # ---------- SEARCH ----------
             if state == "SEARCH":
@@ -1473,6 +2144,26 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                         look_up_period_s=float(cfg.search_look_up_period_s),
                         pan_wrist_only=pan_wrist_only,
                     )
+                    if detected and uv is not None:
+                        s_uv = _filter_bbox_uv(
+                            live,
+                            (float(uv[0]), float(uv[1])),
+                            cfg,
+                            state="SEARCH",
+                        )
+                        d_ps, d_ts, _ = _gaze_joint_deltas(
+                            uv=s_uv,
+                            cx0=cx0,
+                            cy0=cy0,
+                            fx=fx,
+                            fy=fy,
+                            cfg=cfg,
+                        )
+                        gs = float(
+                            getattr(cfg, "search_detection_gaze_scale", 0.65)
+                        )
+                        q_search[0] = float(q_search[0]) + float(d_ps) * gs
+                        q_search[3] = float(q_search[3]) + float(d_ts) * gs
                 q_search = _apply_live_joint_trims(cfg, live, q_search)
                 act = {f"{m}.pos": float(q_search[i]) for i, m in enumerate(ARM_MOTORS)}
                 if "gripper.pos" in obs:
@@ -1483,22 +2174,64 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     logger.warning("[gaze-engine] send_action failed (search): %s", e)
 
                 if detection_streak >= int(cfg.lock_required_frames):
-                    if bool(cfg.preposition_enabled) and bool(
-                        getattr(cfg, "preposition_from_search", False)
-                    ):
+                    lock_depth_err = _depth_err_m(d_filt, float(live["standoff"]))
+                    use_orbit = _use_orbit_preposition(cfg) and (
+                        bool(getattr(cfg, "preposition_from_search", False))
+                        or (
+                            lock_depth_err is not None
+                            and float(lock_depth_err)
+                            > float(
+                                getattr(cfg, "preposition_on_lock_depth_err_m", 0.09)
+                            )
+                        )
+                    )
+                    if use_orbit:
                         next_state = "PREPOSITIONING"
+                    elif lock_depth_err is not None and float(lock_depth_err) > float(
+                        cfg.approach_done_tolerance_m
+                    ):
+                        if _pan_align_required(cfg) and (
+                            bool(getattr(cfg, "pan_align_always_on_lock", True))
+                            or not (
+                                uv is not None
+                                and _is_pan_aligned((float(uv[0]), float(uv[1])), cx0, cfg)
+                            )
+                        ):
+                            next_state = "PAN_ALIGN"
+                        else:
+                            next_state = "APPROACHING"
                     else:
                         next_state = "TRACKING"
                     logger.info(
-                        "[gaze-engine] SEARCH→%s (locked on %d consecutive frames, conf=%.2f)",
+                        "[gaze-engine] SEARCH→%s (locked on %d frames, conf=%.2f, depth_err=%s)",
                         next_state,
                         detection_streak,
                         conf,
+                        f"{lock_depth_err:+.3f}m"
+                        if lock_depth_err is not None
+                        else "n/a",
                     )
                     state = next_state
                     detection_streak = 0
                     miss_streak = 0
                     centered_streak = 0
+                    live["_tracking_enter_t"] = (
+                        float(loop_t) if next_state == "TRACKING" else None
+                    )
+                    live["_preposition_enter_t"] = (
+                        float(loop_t) if next_state == "PREPOSITIONING" else None
+                    )
+                    if next_state == "PREPOSITIONING" and bool(
+                        getattr(cfg, "preposition_sync_radius_to_depth", True)
+                    ):
+                        _sync_preposition_radius_to_depth(live, cfg, d_filt)
+                    if next_state == "APPROACHING":
+                        logger.info(
+                            "[gaze-engine] continuous approach: gaze off until "
+                            "depth_err < %.3fm",
+                            float(getattr(cfg, "fine_gaze_depth_err_m", 0.045)),
+                        )
+                    live["_uv_filt"] = None
                     search_seed = None
                     search_t0 = None
                     search_ramp = 0
@@ -1541,7 +2274,11 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
             # ---------- TRACKING / APPROACH / HOLD share detection bookkeeping ----------
             if not detected:
                 miss_streak += 1
-                if miss_streak >= int(cfg.track_lost_frames):
+                hold_lim = max(0, int(getattr(cfg, "detection_hold_frames", 10)))
+                lost_lim = int(cfg.track_lost_frames)
+                if state in _states_hold_detection() and hold_lim > 0:
+                    lost_lim = lost_lim + hold_lim
+                if miss_streak >= lost_lim:
                     logger.info(
                         "[gaze-engine] %s→SEARCH (lost target for %d frames)",
                         state,
@@ -1598,8 +2335,14 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 continue
             miss_streak = 0
 
+            gaze_uv = _filter_bbox_uv(
+                live,
+                (float(uv[0]), float(uv[1])),
+                cfg,
+                state=state,
+            )
             d_pan, d_tilt, pixel_err = _gaze_joint_deltas(
-                uv=uv, cx0=cx0, cy0=cy0, fx=fx, fy=fy, cfg=cfg
+                uv=gaze_uv, cx0=cx0, cy0=cy0, fx=fx, fy=fy, cfg=cfg
             )
             pan_mult = 1.0
             if live["pan"] is not None:
@@ -1613,13 +2356,90 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 if pixel_err < float(cfg.approach_pixel_threshold_px):
                     pan_mult = float(cfg.gaze_pan_scale_when_aligned)
             d_pan = float(d_pan) * float(pan_mult)
+            depth_err_m = _depth_err_m(d_filt, float(live["standoff"]))
+            pan_err_px = _pan_horizontal_err_px(gaze_uv, cx0)
+            pan_aligned = _is_pan_aligned(gaze_uv, cx0, cfg)
+            motion_live = _live_motion_override_active(live, loop_t)
+            vertical_err_px = float(gaze_uv[1]) - float(cy0)
+            coarse_pan_px = float(getattr(cfg, "pan_align_coarse_pan_err_px", 50.0))
+            coarse_v_px = float(getattr(cfg, "coarse_gaze_tilt_pixel_err_px", 24.0))
+            pan_align_coarse = state == "PAN_ALIGN" and (
+                float(pan_err_px) > coarse_pan_px
+                or abs(float(vertical_err_px)) >= coarse_v_px
+            )
+            # j1-only in PAN_ALIGN when nearly centered; coarse misalignment uses full gaze.
+            pan_only = (
+                (not motion_live)
+                and state == "PAN_ALIGN"
+                and not pan_align_coarse
+            )
+            if pan_only:
+                d_pan = _gaze_pan_only_delta(
+                    uv=gaze_uv,
+                    cx0=cx0,
+                    fx=fx,
+                    cfg=cfg,
+                    pan_err_px=float(pan_err_px),
+                )
+                d_tilt = 0.0
+            allow_pan = _gaze_allow_pan(
+                state=state,
+                depth_err_m=depth_err_m,
+                cfg=cfg,
+                pan_aligned=bool(pan_aligned),
+            )
+            allow_tilt = _gaze_allow_tilt(
+                state=state,
+                depth_err_m=depth_err_m,
+                cfg=cfg,
+                pan_aligned=bool(pan_aligned),
+                pixel_err_px=float(pixel_err),
+                vertical_err_px=vertical_err_px,
+            )
+            if not pan_only:
+                if not allow_pan:
+                    d_pan = 0.0
+                if not allow_tilt:
+                    d_tilt = 0.0
+                coarse_v = float(
+                    getattr(cfg, "coarse_gaze_tilt_pixel_err_px", 24.0)
+                )
+                if abs(vertical_err_px) >= coarse_v and state in (
+                    "APPROACHING",
+                    "PREPOSITIONING",
+                ):
+                    tilt_scale = 1.0
+                elif state == "APPROACHING":
+                    tilt_scale = float(
+                        getattr(cfg, "gaze_scale_during_approach", 0.55)
+                    )
+                elif state == "PREPOSITIONING":
+                    tilt_scale = float(
+                        getattr(cfg, "preposition_gaze_tilt_scale", 0.55)
+                    )
+                else:
+                    tilt_scale = 1.0
+                if state == "PREPOSITIONING":
+                    d_pan = 0.0
+                elif state == "APPROACHING":
+                    gs = float(getattr(cfg, "gaze_scale_during_approach", 1.0))
+                    ts = float(getattr(cfg, "gaze_tilt_scale_during_approach", 1.0))
+                    if abs(float(vertical_err_px)) > float(
+                        getattr(cfg, "approach_steep_vertical_optical_px", 55.0)
+                    ):
+                        ts = max(ts, 1.0)
+                    d_pan = float(d_pan) * gs
+                    tilt_scale = min(float(tilt_scale), ts)
+                d_tilt = float(d_tilt) * float(tilt_scale)
 
             # Default action: gaze deltas only (used by TRACKING and HOLD)
             q_cmd = joints.copy()
 
             advance_to_approach = False
+            advance_from_pan_align = False
             regress_to_tracking = False
             regress_to_preposition = False
+            regress_to_pan_align = False
             preposition_done = False
             approach_done = False
             approach_step_m = 0.0
@@ -1629,13 +2449,14 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
             # Back-project bbox center with bbox-size depth into base frame —
             # used by PREPOSITIONING as p_obj, and by viz for everyone.
             p_obj_for_state: np.ndarray | None = None
-            if d_filt is not None and uv is not None:
+            d_geom = _depth_for_geometry(d_filt, d_bbox, cfg)
+            if d_geom is not None and uv is not None:
                 try:
                     p_obj_for_state = point_cam_to_base(
                         T_base_cam_cur,
                         u=float(uv[0]),
                         v_pix=float(uv[1]),
-                        depth_m=float(d_filt),
+                        depth_m=float(d_geom),
                         fx=fx,
                         fy=fy,
                         cx0=cx0,
@@ -1647,19 +2468,82 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 p_obj_for_state, float(cfg.ik_object_floor_z_m)
             )
 
-            if state == "PREPOSITIONING":
-                emergency_gaze = float(pixel_err) >= float(
-                    cfg.preposition_emergency_gaze_pixel_threshold_px
+            if state == "TRACKING":
+                if live.get("_tracking_enter_t") is None:
+                    live["_tracking_enter_t"] = float(loop_t)
+                stuck_s = float(
+                    getattr(cfg, "tracking_stuck_preposition_s", 5.0)
                 )
+                if (
+                    depth_err_m is not None
+                    and float(depth_err_m)
+                    > float(getattr(cfg, "preposition_on_lock_depth_err_m", 0.09))
+                    and stuck_s > 0.0
+                    and (float(loop_t) - float(live["_tracking_enter_t"])) >= stuck_s
+                ):
+                    if _use_orbit_preposition(cfg):
+                        logger.info(
+                            "[gaze-engine] TRACKING→PREPOSITIONING (stuck %.1fs, "
+                            "depth_err=%+.3fm)",
+                            float(loop_t) - float(live["_tracking_enter_t"]),
+                            float(depth_err_m),
+                        )
+                        state = "PREPOSITIONING"
+                        live["_preposition_enter_t"] = float(loop_t)
+                        if bool(
+                            getattr(cfg, "preposition_sync_radius_to_depth", True)
+                        ):
+                            _sync_preposition_radius_to_depth(live, cfg, d_filt)
+                    else:
+                        logger.info(
+                            "[gaze-engine] TRACKING→APPROACHING (stuck %.1fs, "
+                            "depth_err=%+.3fm)",
+                            float(loop_t) - float(live["_tracking_enter_t"]),
+                            float(depth_err_m),
+                        )
+                        state = "APPROACHING"
+                    centered_streak = 0
+                    live["_tracking_enter_t"] = None
+                    live["_uv_filt"] = None
+
+            if state == "PREPOSITIONING":
+                if live.get("_preposition_enter_t") is None:
+                    live["_preposition_enter_t"] = float(loop_t)
                 orbit_live = _live_orbit_keys_active(live, loop_t)
                 if orbit_live:
-                    emergency_gaze = False
-                if p_obj_for_state is not None and not emergency_gaze:
+                    pre_ow = float(
+                        getattr(cfg, "live_preposition_ik_orientation_weight", 1.2)
+                    )
+                else:
+                    pre_ow = float(cfg.preposition_ik_orientation_weight)
+                if p_obj_for_state is not None and not pan_only:
                     pre_lin: float | None = None
                     pre_dq: float | None = None
+                    pre_ang: float | None = None
+                    snap_se3 = False
                     if loop_t < float(live.get("_boost_until", 0.0)):
                         pre_lin = float(cfg.live_preposition_boost_lin_vel_m_s)
                         pre_dq = float(cfg.live_preposition_boost_joint_step_deg)
+                        pre_ang = float(
+                            getattr(cfg, "live_preposition_boost_ang_vel_deg_s", 220.0)
+                        )
+                        if orbit_live and bool(
+                            getattr(cfg, "live_preposition_snap_se3", True)
+                        ):
+                            snap_se3 = True
+                    last_pre = float(live.get("_last_pre_pos_err", float("nan")))
+                    if math.isnan(last_pre) or last_pre > 0.10:
+                        base_lin = float(cfg.preposition_max_lin_vel_m_s)
+                        pre_lin = max(
+                            float(pre_lin) if pre_lin is not None else base_lin,
+                            base_lin * 1.4,
+                        )
+                        pre_dq = max(
+                            float(pre_dq)
+                            if pre_dq is not None
+                            else float(cfg.preposition_max_joint_step_deg),
+                            float(cfg.preposition_max_joint_step_deg) * 1.2,
+                        )
                     q_pre, p_eye_target, pos_err = _preposition_q(
                         joints_deg=joints,
                         T_base_ee_cur=T_base_ee_cur,
@@ -1673,8 +2557,12 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                         preposition_radius_m=float(live["radius"]),
                         max_lin_vel_m_s=pre_lin,
                         max_joint_step_deg=pre_dq,
+                        max_ang_vel_deg_s=pre_ang,
+                        ik_orientation_weight=pre_ow,
+                        snap_se3=snap_se3,
                     )
                     preposition_pos_err_m = float(pos_err)
+                    live["_last_pre_pos_err"] = float(pos_err)
                     if q_pre is not None:
                         q_cmd = q_pre
                     if bool(cfg.preposition_require_centered_bbox):
@@ -1690,50 +2578,202 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                             preposition_done = True
                     else:
                         centered_streak = 0
-                elif p_obj_for_state is not None:
-                    preposition_pos_err_m = float(
-                        np.linalg.norm(
-                            T_base_ee_cur[:3, 3]
-                            - (
-                                np.asarray(p_obj_for_state, dtype=np.float64)
-                                + approach_unit_vector(
-                                    float(live["az"]), float(live["el"])
-                                )
-                                * float(live["radius"])
-                            )
-                        )
+                    stuck_s = float(
+                        getattr(cfg, "preposition_stuck_approach_s", 6.0)
                     )
+                    stuck_paused = (
+                        _live_orbit_keys_active(live, loop_t)
+                        or time.time()
+                        < float(live.get("_preposition_stuck_pause_until", 0.0))
+                    )
+                    if (
+                        not preposition_done
+                        and not stuck_paused
+                        and stuck_s > 0.0
+                        and live.get("_preposition_enter_t") is not None
+                        and (float(loop_t) - float(live["_preposition_enter_t"]))
+                        >= stuck_s
+                        and preposition_pos_err_m
+                        > float(cfg.preposition_position_tolerance_m)
+                        and depth_err_m is not None
+                        and float(depth_err_m)
+                        > float(cfg.approach_done_tolerance_m)
+                    ):
+                        logger.warning(
+                            "[gaze-engine] PREPOSITIONING stuck %.1fs "
+                            "(pos_err=%.3fm, pixel_err=%.1fpx) → APPROACHING",
+                            float(loop_t) - float(live["_preposition_enter_t"]),
+                            preposition_pos_err_m,
+                            pixel_err,
+                        )
+                        preposition_done = True
+
+            elif state == "PAN_ALIGN":
+                if pan_aligned:
+                    pan_align_streak += 1
+                    if pan_align_streak >= int(
+                        getattr(cfg, "pan_align_consecutive_frames", 4)
+                    ):
+                        advance_from_pan_align = True
+                else:
+                    pan_align_streak = 0
+                    stuck_n = int(live.get("_pan_align_stuck_ticks", 0)) + 1
+                    live["_pan_align_stuck_ticks"] = stuck_n
+                    if stuck_n == int(5.0 * float(cfg.loop_hz)):
+                        logger.warning(
+                            "[gaze-engine] PAN_ALIGN stuck: pan_err=%.1fpx "
+                            "(need <%.0fpx for %d frames). j1-only=%s "
+                            "(coarse if pan>%.0f or |v|>=%.0f).",
+                            pan_err_px,
+                            float(cfg.pan_align_threshold_px),
+                            int(getattr(cfg, "pan_align_consecutive_frames", 4)),
+                            pan_only,
+                            coarse_pan_px,
+                            coarse_v_px,
+                        )
+                if pan_aligned:
+                    live["_pan_align_stuck_ticks"] = 0
 
             elif state == "TRACKING":
-                if pixel_err < float(cfg.approach_pixel_threshold_px):
+                if _pan_align_required(cfg) and not pan_aligned:
+                    pass
+                elif _approach_centering_ok(
+                    pixel_err_px=float(pixel_err),
+                    depth_err_m=depth_err_m,
+                    cfg=cfg,
+                ):
                     centered_streak += 1
                     if centered_streak >= int(cfg.approach_consecutive_centered_frames):
-                        advance_to_approach = True
+                        if _pan_align_required(cfg) and not pan_aligned:
+                            pass
+                        else:
+                            advance_to_approach = True
                 else:
                     centered_streak = 0
 
             elif state == "APPROACHING":
-                if pixel_err > float(cfg.approach_regress_pixel_threshold_px):
-                    if bool(cfg.preposition_enabled):
+                coarse_apr = depth_err_m is not None and float(depth_err_m) > float(
+                    getattr(cfg, "fine_gaze_depth_err_m", 0.045)
+                )
+                if (
+                    bool(getattr(cfg, "approach_regress_to_tracking", False))
+                    and pixel_err > float(cfg.approach_regress_pixel_threshold_px)
+                    and not coarse_apr
+                    and pan_aligned
+                ):
+                    if _use_orbit_preposition(cfg):
                         regress_to_preposition = True
                     else:
                         regress_to_tracking = True
                 else:
+                    reg_px = float(
+                        getattr(cfg, "approach_regress_to_pan_align_px", 58.0)
+                    )
+                    reg_need = max(
+                        int(getattr(cfg, "approach_regress_to_pan_align_frames", 10)),
+                        1,
+                    )
+                    reg_cd = float(
+                        getattr(cfg, "approach_regress_to_pan_align_cooldown_s", 2.5)
+                    )
+                    reg_ok = (
+                        bool(getattr(cfg, "approach_regress_to_pan_align", False))
+                        and coarse_apr
+                        and not pan_aligned
+                        and float(pan_err_px) > reg_px
+                        and loop_t
+                        >= float(live.get("_approach_enter_t", 0.0)) + reg_cd
+                    )
+                    if reg_ok:
+                        live["_pan_regress_streak"] = (
+                            int(live.get("_pan_regress_streak", 0)) + 1
+                        )
+                        if int(live["_pan_regress_streak"]) >= reg_need:
+                            regress_to_pan_align = True
+                    else:
+                        live["_pan_regress_streak"] = 0
+                if (
+                    not regress_to_pan_align
+                    and not regress_to_tracking
+                    and not regress_to_preposition
+                ):
                     if d_filt is not None:
                         apr_lin: float | None = None
                         apr_dq: float | None = None
                         apr_fov_min: float | None = None
+                        apr_ow: float | None = None
                         if loop_t < float(live.get("_boost_until", 0.0)):
                             apr_lin = float(cfg.live_approach_boost_lin_vel_m_s)
                             apr_dq = float(cfg.live_preposition_boost_joint_step_deg)
                             apr_fov_min = float(cfg.live_approach_boost_fov_scale_min)
+                        depth_pri = float(
+                            getattr(cfg, "approach_depth_priority_min_err_m", 0.055)
+                        )
+                        pan_slow = float(
+                            getattr(cfg, "approach_slowdown_pan_err_px", 35.0)
+                        )
+                        slow_for_pan = (
+                            coarse_apr
+                            and pan_err_px > pan_slow
+                            and (
+                                depth_err_m is None
+                                or float(depth_err_m) <= depth_pri
+                            )
+                        )
+                        if slow_for_pan and apr_lin is not None:
+                            apr_lin = float(apr_lin) * float(
+                                getattr(cfg, "approach_slowdown_lin_scale", 0.35)
+                            )
+                        elif slow_for_pan:
+                            apr_lin = float(cfg.approach_max_lin_vel_m_s) * float(
+                                getattr(cfg, "approach_slowdown_lin_scale", 0.35)
+                            )
+                        if (
+                            coarse_apr
+                            and depth_err_m is not None
+                            and float(depth_err_m) > depth_pri
+                        ):
+                            base = float(cfg.approach_max_lin_vel_m_s)
+                            apr_lin = max(
+                                float(apr_lin) if apr_lin is not None else base,
+                                base * 1.75,
+                            )
+                        if coarse_apr:
+                            apr_ow = float(
+                                getattr(
+                                    cfg, "approach_coarse_ik_orientation_weight", 0.45
+                                )
+                            )
+                            apr_dq = max(
+                                float(apr_dq)
+                                if apr_dq is not None
+                                else float(cfg.approach_max_joint_step_deg),
+                                float(cfg.approach_max_joint_step_deg) * 1.5,
+                            )
+                        pause_fwd = _should_pause_approach_forward(
+                            d_bbox=d_bbox,
+                            pixel_err_px=float(pixel_err),
+                            depth_err_m=depth_err_m,
+                            cfg=cfg,
+                        )
+                        d_cmd = (
+                            float(d_geom)
+                            if d_geom is not None
+                            else (
+                                float(d_filt)
+                                if d_filt is not None
+                                else float("nan")
+                            )
+                        )
                         q_apr, planned_step, fov_scale = _approach_q(
                             joints_deg=joints,
                             T_base_ee_cur=T_base_ee_cur,
                             T_base_cam_cur=T_base_cam_cur,
-                            d_obj_m=float(d_filt),
+                            d_obj_m=float(d_cmd),
                             p_obj_base=p_obj_for_state,
                             pixel_err_px=float(pixel_err),
+                            pan_err_px=float(pan_err_px),
+                            vertical_err_px=float(vertical_err_px),
                             cfg=cfg,
                             dt=dt_target,
                             kin=kin,
@@ -1741,14 +2781,29 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                             max_lin_vel_m_s=apr_lin,
                             max_joint_step_deg=apr_dq,
                             fov_scale_min=apr_fov_min,
+                            ik_orientation_weight=apr_ow,
+                            coarse_approach=bool(coarse_apr),
+                            T_ee_cam=T_ee_cam,
+                            pause_forward=bool(pause_fwd),
                         )
                         approach_step_m = float(planned_step)
                         approach_fov_scale = float(fov_scale)
                         if q_apr is not None:
                             q_cmd = q_apr
-                        if (
+                        at_standoff = (
                             abs(float(d_filt) - float(live["standoff"]))
                             < float(cfg.approach_done_tolerance_m)
+                        )
+                        centered_ok = _approach_centering_ok(
+                            pixel_err_px=float(pixel_err),
+                            depth_err_m=depth_err_m,
+                            cfg=cfg,
+                        )
+                        if at_standoff and (
+                            not bool(
+                                getattr(cfg, "approach_require_centered_for_done", True)
+                            )
+                            or centered_ok
                         ):
                             approach_done = True
 
@@ -1756,18 +2811,8 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 # Maintain gaze, no forward motion
                 pass
 
-            # Gaze deltas (after any approach / preposition IK). During PREPOSITIONING
-            # gaze is normally off so look-at IK is not fought — unless bbox error is
-            # large (emergency) so we keep the target in view.
-            allow_pre_gaze = bool(cfg.preposition_apply_gaze) or (
-                state == "PREPOSITIONING"
-                and float(pixel_err)
-                >= float(cfg.preposition_emergency_gaze_pixel_threshold_px)
-                and not _live_orbit_keys_active(live, loop_t)
-            )
-            if not (state == "PREPOSITIONING" and not allow_pre_gaze):
-                q_cmd[i_pan] = float(q_cmd[i_pan]) + d_pan
-                q_cmd[i_tilt] = float(q_cmd[i_tilt]) + d_tilt
+            q_cmd[i_pan] = float(q_cmd[i_pan]) + float(d_pan)
+            q_cmd[i_tilt] = float(q_cmd[i_tilt]) + float(d_tilt)
 
             q_out = _apply_live_joint_trims(cfg, live, q_cmd)
             act = {f"{m}.pos": float(q_out[i]) for i, m in enumerate(ARM_MOTORS)}
@@ -1775,41 +2820,115 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 act["gripper.pos"] = float(obs["gripper.pos"])
             try:
                 robot.send_action(act)
+            except (ConnectionError, OSError, TimeoutError) as e:
+                comm_errors += 1
+                logger.warning(
+                    "[gaze-engine] send_action failed (%d/%d): %s",
+                    comm_errors,
+                    int(getattr(cfg, "comm_error_max_consecutive", 25)),
+                    e,
+                )
+                if comm_errors >= int(getattr(cfg, "comm_error_max_consecutive", 25)):
+                    raise
             except Exception as e:
                 logger.warning("[gaze-engine] send_action failed: %s", e)
 
             # State transitions (apply AFTER sending action so the log reflects
             # what we actually commanded this tick)
             if preposition_done:
-                if bool(cfg.preposition_require_centered_bbox):
+                at_depth = (
+                    depth_err_m is not None
+                    and abs(float(depth_err_m))
+                    < float(cfg.approach_done_tolerance_m)
+                )
+                need_center = bool(cfg.preposition_require_centered_bbox) and (
+                    not _approach_centering_ok(
+                        pixel_err_px=float(pixel_err),
+                        depth_err_m=depth_err_m,
+                        cfg=cfg,
+                    )
+                )
+                if at_depth:
                     logger.info(
-                        "[gaze-engine] PREPOSITIONING→APPROACHING "
-                        "(pos_err=%.3fm < %.3fm, pixel_err=%.1fpx, d=%.3fm)",
+                        "[gaze-engine] PREPOSITIONING→HOLD "
+                        "(pos_err=%.3fm, d=%.3fm at standoff)",
                         preposition_pos_err_m,
-                        float(cfg.preposition_position_tolerance_m),
-                        pixel_err,
                         float(d_filt) if d_filt is not None else float("nan"),
                     )
-                    state = "APPROACHING"
-                else:
+                    state = "HOLD"
+                elif need_center:
                     logger.info(
                         "[gaze-engine] PREPOSITIONING→TRACKING "
-                        "(pos_err=%.3fm < %.3fm; centering before depth approach, d=%.3fm)",
-                        preposition_pos_err_m,
-                        float(cfg.preposition_position_tolerance_m),
-                        float(d_filt) if d_filt is not None else float("nan"),
+                        "(orbit ok, centering before approach, pixel_err=%.1fpx)",
+                        pixel_err,
                     )
                     state = "TRACKING"
+                    live["_tracking_enter_t"] = float(loop_t)
+                elif _pan_align_required(cfg) and not pan_aligned:
+                    logger.info(
+                        "[gaze-engine] PREPOSITIONING→PAN_ALIGN "
+                        "(orbit ok, pan_err=%.1fpx before approach)",
+                        pan_err_px,
+                    )
+                    state = "PAN_ALIGN"
+                    pan_align_streak = 0
+                else:
+                    logger.info(
+                        "[gaze-engine] PREPOSITIONING→APPROACHING "
+                        "(pos_err=%.3fm, pixel_err=%.1fpx, d=%.3fm, depth_err=%s)",
+                        preposition_pos_err_m,
+                        pixel_err,
+                        float(d_filt) if d_filt is not None else float("nan"),
+                        f"{depth_err_m:+.3f}m"
+                        if depth_err_m is not None
+                        else "n/a",
+                    )
+                    state = "APPROACHING"
                 centered_streak = 0
-            elif advance_to_approach:
+                live["_uv_filt"] = None
+            elif advance_from_pan_align:
                 logger.info(
-                    "[gaze-engine] TRACKING→APPROACHING (centered %d frames, err=%.1fpx, d=%.3fm)",
-                    centered_streak,
-                    pixel_err,
-                    float(d_filt) if d_filt is not None else float("nan"),
+                    "[gaze-engine] PAN_ALIGN→APPROACHING "
+                    "(j1 centered %d frames, pan_err=%.1fpx, depth_err=%s)",
+                    pan_align_streak,
+                    pan_err_px,
+                    f"{depth_err_m:+.3f}m" if depth_err_m is not None else "n/a",
                 )
                 state = "APPROACHING"
+                pan_align_streak = 0
                 centered_streak = 0
+                live["_uv_filt"] = None
+            elif advance_to_approach:
+                if _pan_align_required(cfg) and not pan_aligned:
+                    logger.info(
+                        "[gaze-engine] TRACKING→PAN_ALIGN (depth_err=%s, pan_err=%.1fpx)",
+                        f"{depth_err_m:+.3f}m" if depth_err_m is not None else "n/a",
+                        pan_err_px,
+                    )
+                    state = "PAN_ALIGN"
+                else:
+                    logger.info(
+                        "[gaze-engine] TRACKING→APPROACHING "
+                        "(centered %d frames, err=%.1fpx, depth_err=%s)",
+                        centered_streak,
+                        pixel_err,
+                        f"{depth_err_m:+.3f}m" if depth_err_m is not None else "n/a",
+                    )
+                    state = "APPROACHING"
+                centered_streak = 0
+                live["_tracking_enter_t"] = None
+                live["_uv_filt"] = None
+            elif regress_to_pan_align:
+                logger.info(
+                    "[gaze-engine] APPROACHING→PAN_ALIGN "
+                    "(pan_err=%.1fpx, pixel_err=%.1fpx — re-center j1)",
+                    pan_err_px,
+                    pixel_err,
+                )
+                state = "PAN_ALIGN"
+                pan_align_streak = 0
+                centered_streak = 0
+                live["_uv_filt"] = None
             elif regress_to_preposition:
                 logger.info(
                     "[gaze-engine] APPROACHING→PREPOSITIONING (pixel_err=%.1fpx > regress threshold)",
@@ -1817,6 +2936,7 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 )
                 state = "PREPOSITIONING"
                 centered_streak = 0
+                live["_uv_filt"] = None
             elif regress_to_tracking:
                 logger.info(
                     "[gaze-engine] APPROACHING→TRACKING (pixel_err=%.1fpx > regress threshold)",
@@ -1824,6 +2944,8 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 )
                 state = "TRACKING"
                 centered_streak = 0
+                live["_tracking_enter_t"] = float(loop_t)
+                live["_uv_filt"] = None
             elif approach_done:
                 logger.info(
                     "[gaze-engine] APPROACHING→HOLD (d=%.3fm within %.3fm of target)",
@@ -1831,6 +2953,17 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     float(cfg.approach_done_tolerance_m),
                 )
                 state = "HOLD"
+
+            if state == "APPROACHING" and prev_state != "APPROACHING":
+                _reset_approach_depth_filter(live, d_bbox=d_bbox)
+                live["_approach_enter_t"] = float(loop_t)
+                live["_pan_regress_streak"] = 0
+                if gaze_uv is not None:
+                    live["_approach_uv_lock"] = (
+                        float(gaze_uv[0]),
+                        float(gaze_uv[1]),
+                    )
+            prev_state = state
 
             if tick % log_every_n == 0:
                 d_tgt = float(live["standoff"])
@@ -1847,17 +2980,21 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 )
                 logger.info(
                     "[gaze-engine] tick=%d state=%s det=True conf=%.2f "
-                    "pixel_err=%.1fpx d_bbox=%.3fm d_filt=%.3fm d_target=%.3fm "
-                    "depth_err=%+.3fm gaze=(Δpan=%+.2f°,Δtilt=%+.2f°) "
+                    "pixel_err=%.1fpx d_bbox=%.3fm d_stereo=%s d_filt=%.3fm d_target=%.3fm "
+                    "depth_err=%+.3fm pan_err=%.1fpx gaze=(Δpan=%+.2f°,Δtilt=%+.2f°) "
                     "approach_step=%+.4fm fov_scale=%.2f preposition_pos_err=%.3fm",
                     tick,
                     state,
                     conf,
                     pixel_err,
                     float(d_bbox) if d_bbox is not None else float("nan"),
+                    f"{float(d_stereo):.3f}"
+                    if d_stereo is not None
+                    else "n/a",
                     d_meas,
                     d_tgt,
                     depth_err,
+                    pan_err_px,
                     d_pan,
                     d_tilt,
                     approach_step_m,
@@ -1875,7 +3012,10 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                         T_base_cam_cur,
                         u=float(uv[0]),
                         v_pix=float(uv[1]),
-                        depth_m=float(d_filt) if d_filt is not None else float(d_bbox),
+                        depth_m=float(
+                            _depth_for_geometry(d_filt, d_bbox, cfg)
+                            or (d_filt if d_filt is not None else d_bbox)
+                        ),
                         fx=fx,
                         fy=fy,
                         cx0=cx0,
@@ -1884,6 +3024,14 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     p_obj_viz = _maybe_floor_object_base(
                         p_obj_viz, float(cfg.ik_object_floor_z_m)
                     )
+                    if state == "APPROACHING" and p_obj_viz is not None:
+                        prev_p = live.get("_p_obj_viz")
+                        if prev_p is not None:
+                            beta = 0.35
+                            p_obj_viz = (1.0 - beta) * np.asarray(
+                                prev_p, dtype=np.float64
+                            ) + beta * np.asarray(p_obj_viz, dtype=np.float64)
+                        live["_p_obj_viz"] = np.asarray(p_obj_viz, dtype=np.float64)
                     if bool(cfg.viz_clamp_object_to_ground) and p_obj_viz is not None:
                         gz = float(cfg.viz_ground_plane_z_m)
                         if float(p_obj_viz[2]) < gz:

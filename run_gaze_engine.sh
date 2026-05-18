@@ -1,61 +1,6 @@
 #!/usr/bin/env bash
-# Gaze + spherical-orbit servoing for SO-101 + OAK-D eye-in-hand.
-#
-# Architecture: PREPOSITIONING moves the EE on a sphere around the back-projected
-# object to (azimuth, elevation, radius). APPROACHING then shrinks the radius
-# along the **vector to the back-projected object** (not the camera +Z) while a
-# soft visibility regulator throttles depth speed by pixel error so the cube
-# never leaves the FoV.
-#
-# State machine: SEARCH → TRACKING (center with gaze) → APPROACHING → HOLD.
-# Optional orbit: type ``preposition`` or ``top`` on stdin (or set
-# ``--preposition-from-search=true`` to jump SEARCH→PREPOSITIONING like before).
-#
-# Visibility-first: PREPOSITIONING skips large IK when bbox is off-center and
-# uses emergency gaze; object Z is floored for IK so bad depth does not pull
-# the arm through the table.
-#
-# Control handles you'll touch most:
-#   --approach-el-deg   : elevation 0..90 (90 = top-down)
-#   --approach-az-deg   : azimuth around the object's vertical axis
-#   --final-standoff-m  : terminal camera→object distance (depth)
-#   --preposition-initial-radius-m : entry radius (must be > final-standoff)
-#
-# Camera mount: ONE source of truth — `--gripper-camera-tf="x,y,z,rx,ry,rz"`,
-# translation in the EE frame (meters) plus a rotation vector (axis*angle, rad).
-# Fine-tune pitch WITHOUT re-deriving the rotvec via
-#   --gripper-camera-pitch-trim-deg=N
-# (positive N rotates the camera about its own image-right axis, tilting the
-# optical axis further DOWN in the world — frame-agnostic).
-#
-# At startup the engine logs `T_ee_cam` and the cam +Z direction in BASE frame
-# plus the pitch-below-horizon angle. If those don't match your physical mount,
-# adjust the tf string or the pitch trim until they do.
-#
-# If bbox depth reads short vs a tape measure, raise --bbox-depth-scale.
-#
-# Live tuning (same terminal): add --live-control-stdin=true, then type lines:
-#   preposition      — start orbit IK (after you are roughly centered)
-#   top              — overhead preset + preposition
-#   el 88            — approach elevation (degrees)
-#   depth 0.05      — target standoff (meters)
-#   radius 0.22     — orbit radius before final approach
-#   pan 0.15        — damp shoulder_pan gaze (0..1);  pan auto  — auto-weak when centered
-#   up [deg]        — raise arm (shoulder_lift trim +3° default, optional step)
-#   down [deg]      — lower arm (same)
-#   lift 5 | lift reset — set trim to ±deg or clear
-#   status | help
-# Single keys (no Enter): add --live-control-keypress=true with stdin; then
-# every key drives orbit IK (joints 2/3/4) around the OBJECT and look-at:
-#   [ ] or ↓ ↑  — elevation around object (orbit)
-#   ,           — back away (larger orbit radius)
-#   .           — come in (smaller orbit radius)
-#   - / =       — back / in with 2× step (--live-radius-step-m-default)
-#   (standoff / final approach distance only applies in APPROACHING, not PREPOSITION)
-#   p           — re-enter PREPOSITION immediately
-#   ?           — print key help
-# Or append to a file: --live-control-file=/tmp/gaze_cmd.txt
-#   echo "top" >> /tmp/gaze_cmd.txt
+# SEARCH → PAN_ALIGN (j1) → APPROACHING. Live [ ] , . - = orbit around object (PREPOSITION).
+# Type ``depth 0.06`` on stdin to change standoff; ``p`` forces PREPOSITION.
 set -euo pipefail
 
 export PYTHONUNBUFFERED=1
@@ -68,65 +13,125 @@ lerobot-gaze-engine \
   --query="red cube" \
   --model-path=./yolov8s-worldv2.pt \
   --gripper-camera-tf="0.04,0,0.09,-0.2690,0.2824,-1.6014" \
-  --gripper-camera-pitch-trim-deg=0 \
+  --gripper-camera-pitch-trim-deg=-10 \
   --target-physical-size-m=0.03 \
   --bbox-depth-scale=1.0 \
   --bbox-depth-offset-m=0.02 \
   --approach-az-deg=0 \
-  --approach-el-deg=82 \
+  --approach-el-deg=80 \
   --final-standoff-m=0.06 \
   --preposition-enabled=true \
+  --preposition-use-orbit=false \
   --preposition-from-search=false \
-  --preposition-emergency-gaze-pixel-threshold-px=55 \
+  --require-pan-align=true \
+  --pan-align-threshold-px=28 \
+  --pan-align-consecutive-frames=4 \
+  --pan-align-kp-pan=0.55 \
+  --pan-align-max-step-pan-deg=2.8 \
+  --pan-align-coarse-pan-err-px=50 \
+  --pan-align-coarse-max-step-pan-deg=5.0 \
+  --pan-align-coarse-allow-tilt=true \
+  --pan-align-gate-approach=true \
+  --pan-align-always-on-lock=true \
+  --detection-hold-frames=10 \
+  --approach-regress-to-tracking=false \
+  --approach-slowdown-pan-err-px=35 \
+  --approach-slowdown-lin-scale=0.35 \
+  --track-lost-frames=18 \
+  --preposition-on-lock-depth-err-m=0.09 \
+  --tracking-stuck-preposition-s=5.0 \
+  --preposition-stuck-approach-s=12.0 \
+  --preposition-sync-radius-to-depth=true \
+  --preposition-ik-orientation-weight=1.5 \
+  --live-preposition-ik-orientation-weight=1.5 \
+  --preposition-apply-gaze=false \
+  --preposition-require-centered-bbox=false \
+  --preposition-position-tolerance-m=0.06 \
+  --preposition-max-joint-step-deg=10 \
+  --preposition-max-lin-vel-m-s=0.14 \
+  --preposition-max-ang-vel-deg-s=200 \
+  --fine-gaze-depth-err-m=0.045 \
+  --approach-coarse-look-at=false \
+  --approach-coarse-ik-orientation-weight=0.72 \
+  --coarse-gaze-tilt-pixel-err-px=22 \
+  --preposition-gaze-tilt-scale=0.6 \
+  --search-detection-gaze-scale=0.65 \
+  --gaze-scale-during-approach=1.0 \
+  --gaze-tilt-scale-during-approach=1.0 \
+  --gaze-scale-during-preposition=0.0 \
   --ik-object-floor-z-m=0.015 \
   --preposition-initial-radius-m=0.20 \
   --live-control-stdin=true \
   --live-control-keypress=true \
-  --gaze-pan-scale-when-aligned=0.22 \
+  --gaze-pan-scale-when-aligned=0.12 \
   --gaze-pan-scale-aligned-enabled=true \
-  --preposition-position-tolerance-m=0.04 \
-  --preposition-apply-gaze=false \
-  --preposition-require-centered-bbox=false \
-  --preposition-max-joint-step-deg=5 \
-  --preposition-max-lin-vel-m-s=0.08 \
-  --preposition-max-ang-vel-deg-s=150 \
-  --live-el-step-deg-default=5 \
+  --gaze-uv-ema-alpha=0.30 \
+  --live-el-step-deg-default=3 \
   --live-el-min-deg=-30 \
   --live-el-max-deg=135 \
-  --live-radius-step-m-default=0.03 \
-  --live-closeness-step-m-default=0.03 \
-  --live-key-max-steps-per-tick=2 \
-  --live-radius-slew-m-s=0.18 \
-  --live-standoff-slew-m-s=0.06 \
+  --live-radius-step-m-default=0.02 \
   --live-standoff-step-m-default=0.03 \
-  --live-approach-boost-lin-vel-m-s=0.08 \
-  --live-approach-boost-fov-scale-min=0.85 \
-  --live-preposition-boost-duration-s=0.55 \
-  --live-preposition-boost-lin-vel-m-s=0.14 \
+  --live-key-max-steps-per-tick=2 \
+  --live-orbit-boost-duration-s=0.9 \
+  --live-preposition-boost-duration-s=0.9 \
+  --live-el-slew-deg-s=28 \
+  --live-radius-slew-m-s=0.14 \
+  --live-standoff-slew-m-s=0.06 \
+  --live-approach-boost-lin-vel-m-s=0.10 \
+  --live-preposition-boost-lin-vel-m-s=0.16 \
   --live-preposition-boost-joint-step-deg=9 \
-  --preposition-ik-orientation-weight=1.5 \
+  --live-preposition-boost-ang-vel-deg-s=100 \
+  --live-preposition-snap-se3=false \
+  --live-keys-snap-targets=false \
   --approach-use-radial-to-object=true \
-  --approach-fov-soft-threshold-px=35 \
-  --approach-regress-pixel-threshold-px=80 \
+  --approach-optical-only-depth-m=0 \
+  --approach-fov-soft-threshold-px=40 \
+  --approach-fov-use-pan-err-px=true \
+  --approach-fov-min-scale=0.22 \
+  --approach-steep-vertical-optical-px=55 \
+  --approach-regress-pixel-threshold-px=90 \
+  --approach-depth-bypass-enabled=true \
+  --approach-depth-bypass-err-m=0.07 \
+  --approach-depth-bypass-pixel-threshold-px=55 \
+  --approach-use-stereo-depth=true \
+  --approach-bbox-only-depth-max-m=0.22 \
+  --approach-stereo-bbox-max-ratio=1.35 \
+  --approach-pause-depth-max-m=0.20 \
+  --approach-pause-pixel-err-px=55 \
+  --approach-pause-max-depth-err-m=0.048 \
+  --approach-require-centered-for-done=true \
+  --approach-regress-to-pan-align=false \
+  --approach-gaze-uv-ema-alpha=0.22 \
+  --gaze-max-step-tilt-deg=2.0 \
+  --gaze-uv-max-step-px=45 \
+  --gaze-uv-ema-alpha=0.45 \
+  --pan-align-gate-approach=false \
+  --approach-retreat-min-err-m=0.028 \
+  --approach-depth-max-increase-per-tick-m=0.010 \
+  --depth-ema-alpha=0.25 \
+  --approach-depth-priority=false \
+  --approach-depth-priority-min-err-m=0.055 \
+  --approach-depth-min-fraction-per-tick=0.14 \
+  --approach-depth-boost-err-m=0.035 \
+  --approach-depth-boost-lin-scale=2.0 \
   --approach-done-tolerance-m=0.012 \
-  --approach-kp=0.6 \
-  --approach-max-lin-vel-m-s=0.05 \
-  --approach-max-joint-step-deg=2.5 \
-  --gaze-kp-pan=0.45 \
-  --gaze-kp-tilt=0.35 \
-  --gaze-max-step-pan-deg=3.0 \
-  --gaze-max-step-tilt-deg=3.0 \
-  --gaze-deadband-px=6 \
+  --approach-kp=1.05 \
+  --approach-max-lin-vel-m-s=0.14 \
+  --approach-max-joint-step-deg=7.5 \
+  --approach-coarse-max-ang-vel-deg-s=70 \
+  --gaze-kp-pan=0.28 \
+  --gaze-kp-tilt=0.38 \
+  --gaze-max-step-pan-deg=1.4 \
+  --gaze-deadband-px=12 \
   --lock-required-frames=4 \
   --track-lost-frames=12 \
-  --approach-pixel-threshold-px=35 \
-  --approach-consecutive-centered-frames=3 \
-  --depth-ema-alpha=0.35 \
+  --approach-pixel-threshold-px=42 \
+  --approach-consecutive-centered-frames=2 \
   --search-wrist-flex-start-deg=45 \
   --search-wrist-flex-end-deg=4 \
   --search-look-up-period-s=14 \
   --ik-position-weight=2.0 \
-  --ik-orientation-weight=1.0 \
+  --ik-orientation-weight=0.85 \
   --loop-hz=25 \
   --viz-clamp-object-to-ground=true \
   --viz-ground-plane-z-m=0.0 \
