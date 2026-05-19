@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SEARCH → PAN_ALIGN → APPROACHING. Keys move the arm immediately (see help below).
+# SEARCH → PAN_ALIGN → APPROACHING. [ ] , . move arm (PREPOSITION); - = depth.
 set -euo pipefail
 
 export PYTHONUNBUFFERED=1
@@ -13,7 +13,7 @@ lerobot-gaze-engine \
   --query="red cube" \
   --model-path=./yolov8s-worldv2.pt \
   --gripper-camera-tf="0.04,0,0.09,-0.2690,0.2824,-1.6014" \
-  --gripper-camera-pitch-trim-deg=-10 \
+  --gripper-camera-pitch-trim-deg=0 \
   --target-physical-size-m=0.03 \
   --bbox-depth-scale=1.0 \
   --bbox-depth-offset-m=0.02 \
@@ -22,6 +22,10 @@ lerobot-gaze-engine \
   --search-startup-lock-frames=2 \
   --search-min-detection-confidence=0.18 \
   --approach-el-deg=55 \
+  --approach-steep-always-optical=true \
+  --gaze-kp-tilt=0.48 \
+  --approach-gaze-max-tilt-deg-coarse=4.0 \
+  --approach-pause-vertical-err-px=28 \
   --preposition-enabled=true \
   --preposition-apply-gaze=true \
   --live-control-stdin=true \

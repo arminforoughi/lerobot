@@ -186,6 +186,10 @@ class GazeEngineConfig:
     approach_fov_min_scale: float = 0.22
     # Steep camera + large vertical bbox error: slide along view axis, not radial to floor point.
     approach_steep_vertical_optical_px: float = 55.0
+    # If True, always advance along the optical axis when the camera looks steeply down
+    # (top-down / bore-sight approach). If False, radial-to-object is used when the
+    # bbox is vertically centered (can look like a “side” chord even at el=55).
+    approach_steep_always_optical: bool = True
     # When farther than this from goal depth, scale up approach linear velocity.
     approach_depth_boost_err_m: float = 0.05
     approach_depth_boost_lin_scale: float = 2.0
@@ -214,6 +218,10 @@ class GazeEngineConfig:
     approach_pause_pixel_err_px: float = 55.0
     # Still move in if farther than this from goal depth (avoids gaze-only curl at ~15 cm).
     approach_pause_max_depth_err_m: float = 0.048
+    # Pause forward IK when |bbox_v − cy| exceeds this (any range) so wrist can re-center.
+    approach_pause_vertical_err_px: float = 32.0
+    # Do not slide along the bore-sight while the target is far above/below center.
+    approach_optical_max_vertical_err_px: float = 42.0
     # Do not declare approach done on depth alone — bbox must be reasonably centered.
     approach_require_centered_for_done: bool = True
     # Large pan error during coarse approach → re-run j1 PAN_ALIGN.
@@ -222,15 +230,17 @@ class GazeEngineConfig:
     approach_regress_to_pan_align_frames: int = 10
     approach_regress_to_pan_align_cooldown_s: float = 2.5
     # EMA on bbox center during APPROACHING (lower = smoother, less bbox twitch).
-    approach_gaze_uv_ema_alpha: float = 0.22
+    approach_gaze_uv_ema_alpha: float = 0.38
     # Reject bbox-center jumps larger than this (px/tick) — YOLO flicker.
     gaze_uv_max_step_px: float = 45.0
 
     # Gaze (P-control on pixel error → joint deltas, no IK)
     gaze_kp_pan: float = 0.32
-    gaze_kp_tilt: float = 0.22
-    gaze_max_step_pan_deg: float = 1.8
-    gaze_max_step_tilt_deg: float = 1.4
+    gaze_kp_tilt: float = 0.48
+    gaze_max_step_pan_deg: float = 2.0
+    gaze_max_step_tilt_deg: float = 2.4
+    # Stronger wrist steps when the bbox is far off-center in v (look up/down at target).
+    approach_gaze_max_tilt_deg_coarse: float = 4.0
     gaze_deadband_px: float = 10.0
     # EMA on bbox center before gaze (reduces wrist/pan jitter from detector noise).
     gaze_uv_ema_alpha: float = 0.35
@@ -247,9 +257,9 @@ class GazeEngineConfig:
     gaze_pan_scale_during_close_approach: float = 1.0
     # PREPOSITION: wrist tilt only (shoulder_pan would fight orbit IK).
     gaze_scale_during_preposition: float = 0.0
-    preposition_gaze_tilt_scale: float = 0.55
+    preposition_gaze_tilt_scale: float = 1.0
     # Allow wrist tilt while the bbox is off-center vertically, even when far in depth.
-    coarse_gaze_tilt_pixel_err_px: float = 24.0
+    coarse_gaze_tilt_pixel_err_px: float = 14.0
     # Pixel centering (pan/tilt) only when |d_filt - standoff| is below this (m).
     fine_gaze_depth_err_m: float = 0.045
     # Coarse approach: whole-arm look-at IK toward the back-projected object
@@ -601,7 +611,8 @@ def _live_delta_el_deg(live: dict, cfg: GazeEngineConfig, signed_step: float) ->
         )
     else:
         logger.info(
-            "[gaze-live] approach_el_deg → %.1f° (%+.1f°)",
+            "[gaze-live] approach_el_deg → %.1f° (%+.1f°) — no arm motion "
+            "(enable --live-keys-auto-preposition or press p)",
             new_el,
             float(signed_step),
         )
@@ -627,7 +638,8 @@ def _live_delta_radius_m(live: dict, cfg: GazeEngineConfig, signed_step: float) 
         )
     else:
         logger.info(
-            "[gaze-live] orbit radius → %.3fm (%+.3fm)",
+            "[gaze-live] orbit radius → %.3fm (%+.3fm) — no arm motion "
+            "(enable --live-keys-auto-preposition or press p)",
             new_r,
             float(signed_step),
         )
@@ -883,8 +895,8 @@ def _drain_live_keypress(cfg: GazeEngineConfig, live: dict) -> None:
         logger.info("[gaze-live] PREPOSITION requested (key 'p')")
     if want_help:
         logger.info(
-            "[gaze-live] keys: [ ]/↑↓=el , .=radius -==back/in "
-            "p=orbit depth stdin ; max %d/tick ; ? = help",
+            "[gaze-live] keys: [ ]/↑↓=el , .=radius -/==depth p=orbit stdin ; "
+            "max %d/tick ; ? = help",
             max_steps,
         )
 
@@ -963,8 +975,16 @@ def _gaze_joint_deltas(
     fx: float,
     fy: float,
     cfg: GazeEngineConfig,
+    max_pan_deg: float | None = None,
+    max_tilt_deg: float | None = None,
 ) -> tuple[float, float, float]:
     """Pure pixel-error P controller. Returns (Δpan_deg, Δtilt_deg, |err|_px)."""
+    cap_pan = float(
+        max_pan_deg if max_pan_deg is not None else cfg.gaze_max_step_pan_deg
+    )
+    cap_tilt = float(
+        max_tilt_deg if max_tilt_deg is not None else cfg.gaze_max_step_tilt_deg
+    )
     du = float(uv[0]) - float(cx0)
     dv = float(uv[1]) - float(cy0)
     err_px = float(math.hypot(du, dv))
@@ -974,8 +994,8 @@ def _gaze_joint_deltas(
         d_pan = float(
             np.clip(
                 float(cfg.pan_sign) * float(cfg.gaze_kp_pan) * d_pan_deg,
-                -float(cfg.gaze_max_step_pan_deg),
-                +float(cfg.gaze_max_step_pan_deg),
+                -cap_pan,
+                +cap_pan,
             )
         )
     else:
@@ -986,8 +1006,8 @@ def _gaze_joint_deltas(
         d_tilt = float(
             np.clip(
                 float(cfg.wrist_tilt_sign) * float(cfg.gaze_kp_tilt) * d_tilt_deg,
-                -float(cfg.gaze_max_step_tilt_deg),
-                +float(cfg.gaze_max_step_tilt_deg),
+                -cap_tilt,
+                +cap_tilt,
             )
         )
     else:
@@ -1123,9 +1143,13 @@ def _should_pause_approach_forward(
     d_bbox: float | None,
     pixel_err_px: float,
     depth_err_m: float | None,
+    vertical_err_px: float = 0.0,
     cfg: GazeEngineConfig,
 ) -> bool:
-    """Pause translation only when near goal depth and off-center — not at ~15 cm."""
+    """Pause translation when off-center so joint gaze (wrist) can catch up."""
+    v_gate = float(getattr(cfg, "approach_pause_vertical_err_px", 0.0))
+    if v_gate > 0.0 and abs(float(vertical_err_px)) >= v_gate:
+        return True
     if d_bbox is None:
         return False
     if float(pixel_err_px) <= float(
@@ -1320,30 +1344,22 @@ def _gaze_allow_tilt(
     pixel_err_px: float,
     vertical_err_px: float,
 ) -> bool:
-    """Wrist tilt to center the bbox in v — allowed even when pan is gated off."""
+    """Wrist flex follows bbox v — always on when the target is off-center in the image."""
+    if state == "SEARCH":
+        return False
+    if state == "PREPOSITIONING":
+        return bool(cfg.preposition_apply_gaze)
+    if state in ("TRACKING", "APPROACHING", "HOLD"):
+        return float(pixel_err_px) > float(cfg.gaze_deadband_px)
     if state == "PAN_ALIGN":
         if not bool(getattr(cfg, "pan_align_coarse_allow_tilt", True)):
             return False
-        v_thresh = float(getattr(cfg, "coarse_gaze_tilt_pixel_err_px", 24.0))
+        v_thresh = float(getattr(cfg, "coarse_gaze_tilt_pixel_err_px", 14.0))
         return abs(float(vertical_err_px)) > float(cfg.gaze_deadband_px) and (
             abs(float(vertical_err_px)) >= v_thresh
             or float(pixel_err_px) >= v_thresh
         )
-    if state == "SEARCH":
-        return False
-    v_thresh = float(getattr(cfg, "coarse_gaze_tilt_pixel_err_px", 24.0))
-    if abs(float(vertical_err_px)) > float(cfg.gaze_deadband_px) and (
-        abs(float(vertical_err_px)) >= v_thresh
-        or float(pixel_err_px) >= v_thresh
-    ):
-        if state in ("APPROACHING", "PREPOSITIONING", "TRACKING", "HOLD"):
-            return True
-    if state == "PREPOSITIONING":
-        return bool(cfg.preposition_apply_gaze)
-    fine = float(getattr(cfg, "fine_gaze_depth_err_m", 0.045))
-    if depth_err_m is not None and float(depth_err_m) > fine:
-        return False
-    return state in ("TRACKING", "APPROACHING", "HOLD")
+    return False
 
 
 def _use_orbit_preposition(cfg: GazeEngineConfig) -> bool:
@@ -1741,9 +1757,12 @@ def _approach_q(
     if zn > 1e-9:
         z_ax = z_ax / zn
     v_lim = float(getattr(cfg, "approach_steep_vertical_optical_px", 55.0))
-    use_optical = _camera_steep_top_down(T_base_cam_cur, cfg) and abs(
-        float(vertical_err_px)
-    ) >= v_lim
+    steep = _camera_steep_top_down(T_base_cam_cur, cfg)
+    v_opt_max = float(getattr(cfg, "approach_optical_max_vertical_err_px", 42.0))
+    use_optical = steep and (
+        bool(getattr(cfg, "approach_steep_always_optical", True))
+        or abs(float(vertical_err_px)) >= v_lim
+    ) and abs(float(vertical_err_px)) < v_opt_max
     if (
         not use_optical
         and bool(cfg.approach_use_radial_to_object)
@@ -1806,7 +1825,7 @@ def _approach_q(
         frac = float(getattr(cfg, "approach_depth_min_fraction_per_tick", 0.22))
         step = max(step, min(float(err) * frac, max_step))
     if bool(pause_forward):
-        step = 0.0
+        return np.asarray(joints_deg, dtype=np.float64).copy(), 0.0, float(fov_scale)
 
     T_target = np.asarray(T_base_ee_cur, dtype=np.float64).copy()
     T_target[:3, 3] = T_base_ee_cur[:3, 3] + direction * step
@@ -2001,12 +2020,14 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
         "[gaze-engine] intrinsics fx=%.1f fy=%.1f cx=%.1f cy=%.1f", fx, fy, cx0, cy0
     )
     logger.info(
-        "[gaze-engine] approach: coarse_look_at=%s depth_priority=%s "
-        "regress_pan_align=%s (APPROACHING is radial+joint-gaze; "
-        "approach_el/az apply to PREPOSITION orbit only — use [ ] or p)",
+        "[gaze-engine] approach: coarse_look_at=%s steep_always_optical=%s "
+        "(APPROACHING moves along camera view when looking down; "
+        "el=%.0f°/az=%.0f° are PREPOSITION orbit only — press p or "
+        "[ ] with auto-preposition)",
         bool(getattr(cfg, "approach_coarse_look_at", True)),
-        bool(getattr(cfg, "approach_depth_priority", True)),
-        bool(getattr(cfg, "approach_regress_to_pan_align", False)),
+        bool(getattr(cfg, "approach_steep_always_optical", True)),
+        float(cfg.approach_el_deg),
+        float(cfg.approach_az_deg),
     )
     logger.info(
         "[gaze-engine] preposition=%s el=%.1f° bbox_depth_scale=%.3f "
@@ -2060,8 +2081,7 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
     )
     if want_keys and _install_stdin_keypress(live):
         logger.info(
-            "[gaze-live] keys: [ ]/↑↓=el , .=radius -==back/in "
-            "p=orbit depth 0.06 stdin ; ? = help",
+            "[gaze-live] keys: [ ]/↑↓=el , .=radius -/==depth p=orbit stdin ; ? = help",
         )
     elif want_keys:
         logger.warning(
@@ -2229,7 +2249,10 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     state = "PREPOSITIONING"
                     centered_streak = 0
                     live["_preposition_enter_t"] = float(loop_t)
-                    if bool(getattr(cfg, "preposition_sync_radius_to_depth", True)):
+                    # Do not overwrite live [ ] , . radius when user just tuned orbit keys.
+                    if bool(getattr(cfg, "preposition_sync_radius_to_depth", True)) and not (
+                        _live_orbit_keys_active(live, loop_t)
+                    ):
                         _sync_preposition_radius_to_depth(live, cfg, d_filt)
                     live["_goto_preposition"] = False
             if live.get("_goto_approaching", False):
@@ -2239,6 +2262,7 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     "TRACKING",
                     "PAN_ALIGN",
                     "HOLD",
+                    "APPROACHING",
                 ):
                     if state != "APPROACHING":
                         logger.info(
@@ -2589,8 +2613,20 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 cfg,
                 state=state,
             )
+            coarse_v = float(getattr(cfg, "coarse_gaze_tilt_pixel_err_px", 14.0))
+            tilt_cap = float(cfg.gaze_max_step_tilt_deg)
+            if state == "APPROACHING" and abs(float(gaze_uv[1]) - float(cy0)) >= coarse_v:
+                tilt_cap = float(
+                    getattr(cfg, "approach_gaze_max_tilt_deg_coarse", 4.0)
+                )
             d_pan, d_tilt, pixel_err = _gaze_joint_deltas(
-                uv=gaze_uv, cx0=cx0, cy0=cy0, fx=fx, fy=fy, cfg=cfg
+                uv=gaze_uv,
+                cx0=cx0,
+                cy0=cy0,
+                fx=fx,
+                fy=fy,
+                cfg=cfg,
+                max_tilt_deg=tilt_cap,
             )
             pan_mult = 1.0
             if live["pan"] is not None:
@@ -2649,36 +2685,15 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     d_pan = 0.0
                 if not allow_tilt:
                     d_tilt = 0.0
-                coarse_v = float(
-                    getattr(cfg, "coarse_gaze_tilt_pixel_err_px", 24.0)
-                )
-                if abs(vertical_err_px) >= coarse_v and state in (
-                    "APPROACHING",
-                    "PREPOSITIONING",
-                ):
-                    tilt_scale = 1.0
-                elif state == "APPROACHING":
-                    tilt_scale = float(
-                        getattr(cfg, "gaze_scale_during_approach", 0.55)
-                    )
-                elif state == "PREPOSITIONING":
-                    tilt_scale = float(
-                        getattr(cfg, "preposition_gaze_tilt_scale", 0.55)
-                    )
-                else:
-                    tilt_scale = 1.0
                 if state == "PREPOSITIONING":
                     d_pan = 0.0
+                    d_tilt = float(d_tilt) * float(
+                        getattr(cfg, "preposition_gaze_tilt_scale", 0.55)
+                    )
                 elif state == "APPROACHING":
-                    gs = float(getattr(cfg, "gaze_scale_during_approach", 1.0))
-                    ts = float(getattr(cfg, "gaze_tilt_scale_during_approach", 1.0))
-                    if abs(float(vertical_err_px)) > float(
-                        getattr(cfg, "approach_steep_vertical_optical_px", 55.0)
-                    ):
-                        ts = max(ts, 1.0)
-                    d_pan = float(d_pan) * gs
-                    tilt_scale = min(float(tilt_scale), ts)
-                d_tilt = float(d_tilt) * float(tilt_scale)
+                    d_pan = float(d_pan) * float(
+                        getattr(cfg, "gaze_scale_during_approach", 1.0)
+                    )
 
             # Default action: gaze deltas only (used by TRACKING and HOLD)
             q_cmd = joints.copy()
@@ -3002,6 +3017,7 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                             d_bbox=d_bbox,
                             pixel_err_px=float(pixel_err),
                             depth_err_m=depth_err_m,
+                            vertical_err_px=float(vertical_err_px),
                             cfg=cfg,
                         )
                         d_cmd = (
