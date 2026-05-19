@@ -18,11 +18,11 @@ Two decoupled loops:
         minimum range.
 
 State machine:
-  SEARCH    → scan with **shoulder_pan + wrist_flex only** (no whole-arm ramp);
-              after a track loss, gaze at the last bbox center and retreat toward
-              the last lock pose before sweeping. Optional multi-query rotation;
-              on lock by default **TRACKING** (``preposition_from_search=False``).
-              Set ``preposition_from_search=True`` for legacy SEARCH→PREPOSITIONING.
+  SEARCH    → **startup probe** (hold still, YOLO) then **hold→local→sweep**:
+              if the object is already in view, gaze at the bbox and lock in 2 frames
+              without panning away; only sweep if local focus times out. Pan sweep is
+              suppressed while the target is visible. After track loss, optional
+              reacquire at last_uv or hold-before-sweep.
   PREPOSITIONING (optional) → sphere + look-at IK; **emergency gaze** when
               pixel error exceeds ``preposition_emergency_gaze_pixel_threshold_px``
               freezes orbit IK and re-centers so the target stays in view.
@@ -124,8 +124,8 @@ class GazeEngineConfig:
     # If False, skip orbit PREPOSITIONING on lock; go straight to depth APPROACHING
     # (continuous whole-arm servo). Orbit still available via live ``p`` / keys.
     preposition_use_orbit: bool = False
-    # If False, do not add gaze Δpan/Δtilt on top of preposition IK.
-    preposition_apply_gaze: bool = False
+    # Blend bbox gaze with orbit IK during PREPOSITIONING (smoother than IK alone).
+    preposition_apply_gaze: bool = True
     # Legacy: emergency gaze disabled when preposition_apply_gaze is False and
     # fine_gaze_depth_err_m gates all gaze (see below).
     preposition_emergency_gaze_pixel_threshold_px: float = 9999.0
@@ -260,6 +260,23 @@ class GazeEngineConfig:
     approach_coarse_max_ang_vel_deg_s: float = 45.0
     # While SEARCH is sweeping, nudge pan/wrist toward a live detection.
     search_detection_gaze_scale: float = 0.65
+    # Lower confidence gate during SEARCH only (YOLO-World is noisy on first frames).
+    search_min_detection_confidence: float = 0.18
+    # Before sweeping: hold pose and detect (object often already in view).
+    search_startup_probe: bool = True
+    search_startup_probe_frames: int = 15
+    search_startup_hold: bool = True
+    search_startup_hold_s: float = 1.0
+    # Fewer consecutive frames to lock during hold/local/startup probe vs full sweep.
+    search_startup_lock_frames: int = 2
+    # On first detection: freeze pan sweep and gaze hard at the bbox (then lock or sweep).
+    search_local_on_detect: bool = True
+    search_local_gaze_scale: float = 1.0
+    search_local_timeout_s: float = 2.5
+    # During sweep, zero pan sine while the target is visible (keeps streak alive).
+    search_sweep_suppress_when_detected: bool = True
+    # After track loss (no reacquire pose): hold still before sweeping again.
+    search_loss_goto_hold: bool = True
 
     # Live tuning (stdin and/or append-only file). Each non-empty line is a command.
     # Stdin: enable with ``live_control_stdin=True`` (type lines + Enter in the same
@@ -301,13 +318,13 @@ class GazeEngineConfig:
     # Orbit radius/el used by IK slew toward the live target at this rate.
     live_radius_slew_m_s: float = 0.18
     live_standoff_slew_m_s: float = 0.04
-    live_el_slew_deg_s: float = 32.0
+    live_el_slew_deg_s: float = 72.0
     live_approach_boost_lin_vel_m_s: float = 0.06
     live_approach_boost_fov_scale_min: float = 0.85
     # Briefly raise preposition speed after a live key so motion keeps up with
     # the target (avoids "nothing… then jump").
-    live_preposition_boost_duration_s: float = 0.55
-    live_orbit_boost_duration_s: float = 1.25
+    live_preposition_boost_duration_s: float = 1.2
+    live_orbit_boost_duration_s: float = 1.2
     live_preposition_boost_lin_vel_m_s: float = 0.14
     live_preposition_boost_joint_step_deg: float = 9.0
     live_preposition_boost_ang_vel_deg_s: float = 120.0
@@ -317,9 +334,11 @@ class GazeEngineConfig:
     live_preposition_snap_se3: bool = False
     # When snap_se3: max fraction of pose gap closed per tick (0.25–0.5 = smooth).
     live_preposition_snap_alpha_max: float = 0.32
-    # Keypress: jump el/radius/standoff targets immediately; False = slew toward target.
-    live_keys_snap_targets: bool = False
-    live_key_max_steps_per_tick: int = 2
+    # Keypress: jump el/radius/standoff targets immediately (responsive keys).
+    live_keys_snap_targets: bool = True
+    live_key_max_steps_per_tick: int = 8
+    # If True (default), [ ] , . move the arm via PREPOSITIONING; set False to tune targets only.
+    live_keys_auto_preposition: bool = True
 
     # State machine
     lock_required_frames: int = 4
@@ -570,14 +589,22 @@ def _live_delta_el_deg(live: dict, cfg: GazeEngineConfig, signed_step: float) ->
     live["el_target"] = new_el
     if bool(getattr(cfg, "live_keys_snap_targets", True)):
         _live_snap_el(live, new_el)
-    _live_arm_motion_boost(live, cfg, orbit=True)
-    live["_goto_preposition"] = True
-    logger.info(
-        "[gaze-live] approach_el_deg → %.1f° (%+.1f°, %s) PREPOSITION",
-        new_el,
-        float(signed_step),
-        "snap" if bool(getattr(cfg, "live_keys_snap_targets", True)) else "slewing",
-    )
+    auto_p = bool(getattr(cfg, "live_keys_auto_preposition", True))
+    if auto_p:
+        _live_arm_motion_boost(live, cfg, orbit=True)
+        live["_goto_preposition"] = True
+        logger.info(
+            "[gaze-live] approach_el_deg → %.1f° (%+.1f°, %s) PREPOSITION",
+            new_el,
+            float(signed_step),
+            "snap" if bool(getattr(cfg, "live_keys_snap_targets", True)) else "slewing",
+        )
+    else:
+        logger.info(
+            "[gaze-live] approach_el_deg → %.1f° (%+.1f°)",
+            new_el,
+            float(signed_step),
+        )
 
 
 def _live_delta_radius_m(live: dict, cfg: GazeEngineConfig, signed_step: float) -> None:
@@ -588,14 +615,22 @@ def _live_delta_radius_m(live: dict, cfg: GazeEngineConfig, signed_step: float) 
     live["radius_target"] = new_r
     if bool(getattr(cfg, "live_keys_snap_targets", True)):
         _live_snap_radius(live, new_r)
-    _live_arm_motion_boost(live, cfg, orbit=True)
-    live["_goto_preposition"] = True
-    logger.info(
-        "[gaze-live] orbit radius → %.3fm (%+.3fm, %s) PREPOSITION",
-        new_r,
-        float(signed_step),
-        "snap" if bool(getattr(cfg, "live_keys_snap_targets", True)) else "slewing",
-    )
+    auto_p = bool(getattr(cfg, "live_keys_auto_preposition", True))
+    if auto_p:
+        _live_arm_motion_boost(live, cfg, orbit=True)
+        live["_goto_preposition"] = True
+        logger.info(
+            "[gaze-live] orbit radius → %.3fm (%+.3fm, %s) PREPOSITION",
+            new_r,
+            float(signed_step),
+            "snap" if bool(getattr(cfg, "live_keys_snap_targets", True)) else "slewing",
+        )
+    else:
+        logger.info(
+            "[gaze-live] orbit radius → %.3fm (%+.3fm)",
+            new_r,
+            float(signed_step),
+        )
 
 
 def _live_delta_standoff_m(live: dict, cfg: GazeEngineConfig, signed_step: float) -> None:
@@ -810,15 +845,15 @@ def _drain_live_keypress(cfg: GazeEngineConfig, live: dict) -> None:
             net_el -= 1
         elif c == ord("]"):
             net_el += 1
-        # , . = orbit radius; - / = = radius 2× (standoff: stdin ``depth`` only)
+        # , . = orbit radius; - = back (farther), = = in (closer standoff)
         elif c == ord(","):
             net_rad += 1
         elif c == ord("."):
             net_rad -= 1
         elif c in (ord("-"), ord("_")):
-            net_rad += 2
+            net_standoff += 1
         elif c in (ord("="), ord("+")):
-            net_rad -= 2
+            net_standoff -= 1
         elif c == ord("p"):
             want_preposition = True
         elif c == ord("?"):
@@ -848,8 +883,8 @@ def _drain_live_keypress(cfg: GazeEngineConfig, live: dict) -> None:
         logger.info("[gaze-live] PREPOSITION requested (key 'p')")
     if want_help:
         logger.info(
-            "[gaze-live] keys: [ ]/↑↓=el ; ,.=radius ; -=back +=in (2×) ; "
-            "depth via stdin ; max %d/tick ; p=preposition ; ? = help",
+            "[gaze-live] keys: [ ]/↑↓=el , .=radius -==back/in "
+            "p=orbit depth stdin ; max %d/tick ; ? = help",
             max_steps,
         )
 
@@ -1335,6 +1370,159 @@ def _approach_centering_ok(
     return pixel_err_px < float(
         getattr(cfg, "approach_depth_bypass_pixel_threshold_px", 52.0)
     )
+
+
+def _search_min_confidence(cfg: GazeEngineConfig) -> float:
+    base = float(cfg.min_detection_confidence)
+    lo = float(getattr(cfg, "search_min_detection_confidence", base))
+    return float(min(base, lo))
+
+
+def _search_lock_frame_threshold(cfg: GazeEngineConfig, search_phase: str) -> int:
+    if str(search_phase) in ("hold", "local"):
+        return max(1, int(getattr(cfg, "search_startup_lock_frames", 2)))
+    return max(1, int(cfg.lock_required_frames))
+
+
+def _parse_yolo_detection(
+    det,
+    cfg: GazeEngineConfig,
+    *,
+    in_search: bool,
+) -> tuple[
+    tuple[float, float, float, float] | None,
+    tuple[float, float] | None,
+    float,
+    bool,
+]:
+    conf = 0.0
+    if det is None:
+        return None, None, conf, False
+    conf = float(getattr(det, "confidence", 0.0))
+    thresh = _search_min_confidence(cfg) if in_search else float(cfg.min_detection_confidence)
+    if conf < thresh:
+        return None, None, conf, False
+    bbox_xyxy = (
+        float(det.xyxy[0]),
+        float(det.xyxy[1]),
+        float(det.xyxy[2]),
+        float(det.xyxy[3]),
+    )
+    uv = (
+        0.5 * (bbox_xyxy[0] + bbox_xyxy[2]),
+        0.5 * (bbox_xyxy[1] + bbox_xyxy[3]),
+    )
+    return bbox_xyxy, uv, conf, True
+
+
+def _compute_search_lock_state(
+    cfg: GazeEngineConfig,
+    *,
+    d_filt: float | None,
+    standoff_m: float,
+    uv: tuple[float, float] | None,
+    cx0: float,
+) -> str:
+    lock_depth_err = _depth_err_m(d_filt, float(standoff_m))
+    use_orbit = _use_orbit_preposition(cfg) and (
+        bool(getattr(cfg, "preposition_from_search", False))
+        or (
+            lock_depth_err is not None
+            and float(lock_depth_err)
+            > float(getattr(cfg, "preposition_on_lock_depth_err_m", 0.09))
+        )
+    )
+    if use_orbit:
+        return "PREPOSITIONING"
+    if lock_depth_err is not None and float(lock_depth_err) > float(
+        cfg.approach_done_tolerance_m
+    ):
+        if _pan_align_required(cfg) and (
+            bool(getattr(cfg, "pan_align_always_on_lock", True))
+            or not (
+                uv is not None
+                and _is_pan_aligned((float(uv[0]), float(uv[1])), cx0, cfg)
+            )
+        ):
+            return "PAN_ALIGN"
+        return "APPROACHING"
+    return "TRACKING"
+
+
+def _startup_search_probe(
+    *,
+    robot,
+    detector,
+    cfg: GazeEngineConfig,
+    live: dict,
+    fx: float,
+    fy: float,
+    cx0: float,
+    cy0: float,
+    depth_scale: float = 0.001,
+) -> tuple[str | None, float | None]:
+    """Hold the arm still and run YOLO; skip SEARCH when the object is already in view."""
+    if not bool(getattr(cfg, "search_startup_probe", True)):
+        return None, None
+    max_frames = max(1, int(getattr(cfg, "search_startup_probe_frames", 15)))
+    need = max(1, int(getattr(cfg, "search_startup_lock_frames", 2)))
+    streak = 0
+    d_filt: float | None = None
+    dt_sleep = 1.0 / max(1.0, float(cfg.loop_hz))
+    last_conf = 0.0
+    for _ in range(max_frames):
+        try:
+            obs = robot.get_observation()
+        except (ConnectionError, OSError, TimeoutError):
+            break
+        rgb = obs.get(cfg.camera_key)
+        if rgb is None:
+            time.sleep(dt_sleep)
+            continue
+        det = detector.best_detection(np.asarray(rgb))
+        bbox_xyxy, uv, conf, detected = _parse_yolo_detection(det, cfg, in_search=True)
+        last_conf = float(conf)
+        if detected and bbox_xyxy is not None:
+            streak += 1
+            depth = obs.get(f"{cfg.camera_key}_depth")
+            d_meas, _, _ = _measure_object_depth_m(
+                depth_map=depth,
+                bbox_xyxy=bbox_xyxy,
+                fx=fx,
+                fy=fy,
+                cfg=cfg,
+                depth_scale=float(depth_scale),
+            )
+            if d_meas is not None:
+                alpha = float(cfg.depth_ema_alpha)
+                d_filt = (
+                    float(d_meas)
+                    if d_filt is None
+                    else (1.0 - alpha) * float(d_filt) + alpha * float(d_meas)
+                )
+        else:
+            streak = 0
+        if streak >= need and uv is not None:
+            next_state = _compute_search_lock_state(
+                cfg,
+                d_filt=d_filt,
+                standoff_m=float(live["standoff"]),
+                uv=uv,
+                cx0=cx0,
+            )
+            logger.info(
+                "[gaze-engine] startup probe: locked in %d frames (conf=%.2f) → %s",
+                streak,
+                last_conf,
+                next_state,
+            )
+            return next_state, d_filt
+        time.sleep(dt_sleep)
+    logger.info(
+        "[gaze-engine] startup probe: no lock in %d frames (will SEARCH with hold→local)",
+        max_frames,
+    )
+    return None, None
 
 
 def _search_command(
@@ -1858,7 +2046,10 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
     search_seed: np.ndarray | None = None
     search_t0: float | None = None
     search_ramp = 0
-    search_phase = "sweep"  # "reacquire" | "sweep"
+    search_phase = (
+        "hold" if bool(getattr(cfg, "search_startup_hold", True)) else "sweep"
+    )  # hold | local | sweep | reacquire
+    search_local_since: float | None = None
     search_reacquire_frames = 0
     lock_uv: tuple[float, float] | None = None
     lock_joints: np.ndarray | None = None
@@ -1869,8 +2060,8 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
     )
     if want_keys and _install_stdin_keypress(live):
         logger.info(
-            "[gaze-live] keypress: [ ]/↑↓=el ; ,.=radius ; -=back +=in (2×) ; "
-            "p=preposition ; ? = help",
+            "[gaze-live] keys: [ ]/↑↓=el , .=radius -==back/in "
+            "p=orbit depth 0.06 stdin ; ? = help",
         )
     elif want_keys:
         logger.warning(
@@ -1910,6 +2101,25 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
         )
     except Exception as e:
         logger.warning("[gaze-engine] startup geometry log failed: %s", e)
+
+    probed_state, probed_d = _startup_search_probe(
+        robot=robot,
+        detector=detector,
+        cfg=cfg,
+        live=live,
+        fx=fx,
+        fy=fy,
+        cx0=cx0,
+        cy0=cy0,
+        depth_scale=float(intrinsics.get("depth_scale", 0.001)),
+    )
+    if probed_state is not None:
+        state = str(probed_state)
+        prev_state = state
+        if probed_d is not None:
+            d_filt = float(probed_d)
+        search_phase = "sweep"
+        search_seed = None
 
     comm_errors = 0
     try:
@@ -1965,24 +2175,9 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     )
 
             det = detector.best_detection(np.asarray(rgb))
-            bbox_xyxy: tuple[float, float, float, float] | None = None
-            uv: tuple[float, float] | None = None
-            conf = 0.0
-            if det is not None:
-                conf = float(getattr(det, "confidence", 0.0))
-                if conf >= float(cfg.min_detection_confidence):
-                    bbox_xyxy = (
-                        float(det.xyxy[0]),
-                        float(det.xyxy[1]),
-                        float(det.xyxy[2]),
-                        float(det.xyxy[3]),
-                    )
-                    uv = (
-                        0.5 * (bbox_xyxy[0] + bbox_xyxy[2]),
-                        0.5 * (bbox_xyxy[1] + bbox_xyxy[3]),
-                    )
-
-            detected = bbox_xyxy is not None and uv is not None
+            bbox_xyxy, uv, conf, detected = _parse_yolo_detection(
+                det, cfg, in_search=(state == "SEARCH")
+            )
             detected, bbox_xyxy, uv, conf = _apply_detection_hold(
                 detected=detected,
                 bbox_xyxy=bbox_xyxy,
@@ -2100,6 +2295,51 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 )
                 elapsed = float(loop_t - (search_t0 or loop_t))
                 pan_wrist_only = bool(getattr(cfg, "search_joints_pan_wrist_only", True))
+                hold_s = float(getattr(cfg, "search_startup_hold_s", 1.0))
+                local_timeout = float(getattr(cfg, "search_local_timeout_s", 2.5))
+
+                if (
+                    detected
+                    and bool(getattr(cfg, "search_local_on_detect", True))
+                    and str(search_phase) in ("hold", "sweep")
+                ):
+                    if str(search_phase) != "local":
+                        search_phase = "local"
+                        search_local_since = float(loop_t)
+                        logger.info(
+                            "[gaze-engine] SEARCH focus-local at uv=(%.0f,%.0f) conf=%.2f",
+                            float(uv[0]) if uv else 0.0,
+                            float(uv[1]) if uv else 0.0,
+                            conf,
+                        )
+                if str(search_phase) == "hold" and hold_s > 0.0:
+                    if float(elapsed) >= hold_s and detection_streak < _search_lock_frame_threshold(
+                        cfg, "hold"
+                    ):
+                        search_phase = "sweep"
+                        search_t0 = loop_t
+                        search_ramp = 0
+                        logger.info(
+                            "[gaze-engine] SEARCH hold→sweep (%.1fs, no lock)",
+                            float(elapsed),
+                        )
+                if (
+                    str(search_phase) == "local"
+                    and search_local_since is not None
+                    and local_timeout > 0.0
+                    and (float(loop_t) - float(search_local_since)) >= local_timeout
+                    and detection_streak
+                    < _search_lock_frame_threshold(cfg, "local")
+                ):
+                    search_phase = "sweep"
+                    search_local_since = None
+                    search_t0 = loop_t
+                    search_ramp = 0
+                    logger.info(
+                        "[gaze-engine] SEARCH local→sweep (%.1fs without lock)",
+                        local_timeout,
+                    )
+
                 in_reacquire = (
                     str(search_phase) == "reacquire"
                     and lock_uv is not None
@@ -2131,12 +2371,21 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                             float(lock_uv[0]),
                             float(lock_uv[1]),
                         )
+                elif str(search_phase) == "hold":
+                    q_search = np.asarray(search_seed, dtype=np.float64).copy()
+                elif str(search_phase) == "local":
+                    q_search = np.asarray(joints, dtype=np.float64).copy()
                 else:
+                    pan_amp_eff = float(cfg.search_pan_amplitude_deg)
+                    if detected and bool(
+                        getattr(cfg, "search_sweep_suppress_when_detected", True)
+                    ):
+                        pan_amp_eff = 0.0
                     q_search = _search_command(
                         seed=search_seed,
                         elapsed_s=elapsed,
                         ramp_alpha=ramp_alpha,
-                        pan_amp_deg=float(cfg.search_pan_amplitude_deg),
+                        pan_amp_deg=pan_amp_eff,
                         pan_period_s=float(cfg.search_pan_period_s),
                         lift_target_deg=float(cfg.search_shoulder_lift_target_deg),
                         wrist_start_deg=float(cfg.search_wrist_flex_start_deg),
@@ -2144,26 +2393,35 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                         look_up_period_s=float(cfg.search_look_up_period_s),
                         pan_wrist_only=pan_wrist_only,
                     )
-                    if detected and uv is not None:
-                        s_uv = _filter_bbox_uv(
-                            live,
-                            (float(uv[0]), float(uv[1])),
-                            cfg,
-                            state="SEARCH",
-                        )
-                        d_ps, d_ts, _ = _gaze_joint_deltas(
-                            uv=s_uv,
-                            cx0=cx0,
-                            cy0=cy0,
-                            fx=fx,
-                            fy=fy,
-                            cfg=cfg,
-                        )
+                if detected and uv is not None and str(search_phase) in (
+                    "hold",
+                    "local",
+                    "sweep",
+                ):
+                    s_uv = _filter_bbox_uv(
+                        live,
+                        (float(uv[0]), float(uv[1])),
+                        cfg,
+                        state="SEARCH",
+                    )
+                    d_ps, d_ts, _ = _gaze_joint_deltas(
+                        uv=s_uv,
+                        cx0=cx0,
+                        cy0=cy0,
+                        fx=fx,
+                        fy=fy,
+                        cfg=cfg,
+                    )
+                    if str(search_phase) == "local":
+                        gs = float(getattr(cfg, "search_local_gaze_scale", 1.0))
+                    elif str(search_phase) == "hold":
+                        gs = float(getattr(cfg, "search_local_gaze_scale", 1.0))
+                    else:
                         gs = float(
                             getattr(cfg, "search_detection_gaze_scale", 0.65)
                         )
-                        q_search[0] = float(q_search[0]) + float(d_ps) * gs
-                        q_search[3] = float(q_search[3]) + float(d_ts) * gs
+                    q_search[0] = float(q_search[0]) + float(d_ps) * gs
+                    q_search[3] = float(q_search[3]) + float(d_ts) * gs
                 q_search = _apply_live_joint_trims(cfg, live, q_search)
                 act = {f"{m}.pos": float(q_search[i]) for i, m in enumerate(ARM_MOTORS)}
                 if "gripper.pos" in obs:
@@ -2173,39 +2431,23 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 except Exception as e:
                     logger.warning("[gaze-engine] send_action failed (search): %s", e)
 
-                if detection_streak >= int(cfg.lock_required_frames):
+                lock_need = _search_lock_frame_threshold(cfg, str(search_phase))
+                if detection_streak >= lock_need:
                     lock_depth_err = _depth_err_m(d_filt, float(live["standoff"]))
-                    use_orbit = _use_orbit_preposition(cfg) and (
-                        bool(getattr(cfg, "preposition_from_search", False))
-                        or (
-                            lock_depth_err is not None
-                            and float(lock_depth_err)
-                            > float(
-                                getattr(cfg, "preposition_on_lock_depth_err_m", 0.09)
-                            )
-                        )
+                    next_state = _compute_search_lock_state(
+                        cfg,
+                        d_filt=d_filt,
+                        standoff_m=float(live["standoff"]),
+                        uv=uv,
+                        cx0=cx0,
                     )
-                    if use_orbit:
-                        next_state = "PREPOSITIONING"
-                    elif lock_depth_err is not None and float(lock_depth_err) > float(
-                        cfg.approach_done_tolerance_m
-                    ):
-                        if _pan_align_required(cfg) and (
-                            bool(getattr(cfg, "pan_align_always_on_lock", True))
-                            or not (
-                                uv is not None
-                                and _is_pan_aligned((float(uv[0]), float(uv[1])), cx0, cfg)
-                            )
-                        ):
-                            next_state = "PAN_ALIGN"
-                        else:
-                            next_state = "APPROACHING"
-                    else:
-                        next_state = "TRACKING"
                     logger.info(
-                        "[gaze-engine] SEARCH→%s (locked on %d frames, conf=%.2f, depth_err=%s)",
+                        "[gaze-engine] SEARCH→%s (locked %d/%d frames, phase=%s, "
+                        "conf=%.2f, depth_err=%s)",
                         next_state,
                         detection_streak,
+                        lock_need,
+                        search_phase,
                         conf,
                         f"{lock_depth_err:+.3f}m"
                         if lock_depth_err is not None
@@ -2236,17 +2478,19 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     search_t0 = None
                     search_ramp = 0
                     search_phase = "sweep"
+                    search_local_since = None
                     search_reacquire_frames = 0
 
                 if tick % log_every_n == 0:
                     logger.info(
                         "[gaze-engine] tick=%d state=SEARCH phase=%s det=%s conf=%.2f "
-                        "streak=%d ramp=%.2f",
+                        "streak=%d/%d ramp=%.2f",
                         tick,
                         search_phase,
                         detected,
                         conf,
                         detection_streak,
+                        _search_lock_frame_threshold(cfg, str(search_phase)),
                         ramp_alpha,
                     )
                 _rerun_log(
@@ -2259,7 +2503,7 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     cx0=cx0,
                     cy0=cy0,
                     conf=conf,
-                    phase="search",
+                    phase=f"search_{search_phase}",
                     depth_m=d_bbox,
                     kin=kin,
                     joints_deg=joints,
@@ -2309,7 +2553,11 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                             float(lock_uv[1]),
                         )
                     else:
-                        search_phase = "sweep"
+                        if bool(getattr(cfg, "search_loss_goto_hold", True)):
+                            search_phase = "hold"
+                        else:
+                            search_phase = "sweep"
+                        search_local_since = None
                         search_seed = None
                         search_t0 = None
                 _rerun_log(
