@@ -55,11 +55,14 @@ def wait_for_convergence(
     timeout_s: float = 4.0,
     threshold_deg: float = 1.5,
     dt: float = 0.03,
+    on_tick=None,
 ) -> bool:
     start = time.time()
     max_err = float("inf")
     while time.time() - start < timeout_s:
         robot.send_action(target_joints)
+        if on_tick is not None:
+            on_tick()
         time.sleep(dt)
         obs = robot.get_observation()
         errors = []
@@ -134,6 +137,7 @@ def execute_waypoint(
     motion: MotionExecutionConfig | None = None,
     *,
     current_joints: np.ndarray | None = None,
+    on_tick=None,
 ) -> np.ndarray:
     """Execute a *single* waypoint and return the resulting joint vector.
 
@@ -213,11 +217,14 @@ def execute_waypoint(
                 timeout_s=motion.settle_timeout_s,
                 threshold_deg=motion.settle_threshold_deg,
                 dt=motion.settle_dt,
+                on_tick=on_tick,
             )
             if not ok:
                 logger.warning("[motion] segment did not converge within timeout; continuing")
         else:
             robot.send_action(action)
+            if on_tick is not None:
+                on_tick()
             time.sleep(motion.inter_step_sleep_s)
 
         current_joints = np.array(
@@ -420,6 +427,8 @@ def execute_cartesian_nudge_base(
     motor_names: list[str],
     delta_base: np.ndarray,
     motion: MotionExecutionConfig | None = None,
+    *,
+    on_tick=None,
 ) -> None:
     """Apply a small base-frame translation to the current EE pose (orientation unchanged)."""
     delta = np.asarray(delta_base, dtype=np.float64).reshape(3)
@@ -438,4 +447,7 @@ def execute_cartesian_nudge_base(
         gripper_width_pct=g_pct,
         label="cartesian_nudge",
     )
-    execute_waypoint(robot, kinematics, wp, motor_names, motion, current_joints=current_joints)
+    execute_waypoint(
+        robot, kinematics, wp, motor_names, motion,
+        current_joints=current_joints, on_tick=on_tick,
+    )

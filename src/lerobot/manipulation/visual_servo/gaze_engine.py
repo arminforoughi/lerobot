@@ -30,6 +30,7 @@ State machine:
   TRACKING  → gaze only until centered, then PAN_ALIGN or APPROACHING.
   APPROACHING → radial approach + look-at IK (blocked until PAN_ALIGN done).
   HOLD      → depth within tolerance of standoff; maintain gaze.
+  GRASP     → open gripper, final approach, close with current sensing, then HOLD.
 
 This is intentionally separate from ``cvs_engine`` — the goal is to never let
 the object leave the FoV, which is the failure mode that motivated the
@@ -61,9 +62,13 @@ from lerobot.manipulation.yolo_track.math_utils import (
     parse_tf_string,
     point_cam_to_base,
 )
+from lerobot.manipulation.visual_servo.grasp_close import (
+    GraspCloseConfig,
+    run_grasp_sequence,
+)
 from lerobot.robots import RobotConfig, make_robot_from_config
 from lerobot.robots.so_follower import SOFollowerRobotConfig
-from lerobot.utils.motion_executor import interpolate_se3
+from lerobot.utils.motion_executor import MotionExecutionConfig, interpolate_se3
 from lerobot.utils.utils import init_logging
 
 logger = logging.getLogger(__name__)
@@ -191,11 +196,13 @@ class GazeEngineConfig:
     # bbox is vertically centered (can look like a “side” chord even at el=55).
     approach_steep_always_optical: bool = True
     # When farther than this from goal depth, scale up approach linear velocity.
-    approach_depth_boost_err_m: float = 0.05
+    # Low threshold so the final few cm (the band where it used to stall) still
+    # get the speed boost instead of creeping at ~1.8 mm/tick.
+    approach_depth_boost_err_m: float = 0.02
     approach_depth_boost_lin_scale: float = 2.0
     # If True, ignore pixel-error slowdown while still far in depth (faster but can
-    # drift off bbox). Default False = original visibility regulator at all ranges.
-    approach_depth_priority: bool = False
+    # drift off bbox). Default True for conservative depth-first closing.
+    approach_depth_priority: bool = True
     # While depth_err is above this, do not slow approach for pan misalignment.
     approach_depth_priority_min_err_m: float = 0.055
     # Minimum fraction of remaining depth error closed per tick (capped by max speed).
@@ -217,7 +224,9 @@ class GazeEngineConfig:
     approach_pause_depth_max_m: float = 0.20
     approach_pause_pixel_err_px: float = 55.0
     # Still move in if farther than this from goal depth (avoids gaze-only curl at ~15 cm).
-    approach_pause_max_depth_err_m: float = 0.048
+    # Keep driving forward until within ~2 cm of the standoff; only then pause to
+    # fine-center. Larger values let vertical parallax stall the approach early.
+    approach_pause_max_depth_err_m: float = 0.020
     # Pause forward IK when |bbox_v − cy| exceeds this (any range) so wrist can re-center.
     approach_pause_vertical_err_px: float = 32.0
     # Do not slide along the bore-sight while the target is far above/below center.
@@ -262,11 +271,13 @@ class GazeEngineConfig:
     coarse_gaze_tilt_pixel_err_px: float = 14.0
     # Pixel centering (pan/tilt) only when |d_filt - standoff| is below this (m).
     fine_gaze_depth_err_m: float = 0.045
-    # Coarse approach: whole-arm look-at IK toward the back-projected object
-    # (keeps the bbox in view; position-only IK leaves the camera pointing at
-    # the floor while the arm translates).
-    approach_coarse_look_at: bool = True
-    approach_coarse_ik_orientation_weight: float = 0.45
+    # Coarse approach: whole-arm look-at IK toward the back-projected object.
+    # Default False — position-only IK is more reliable on the 5-DoF SO-101 and
+    # avoids freezing ~15 cm short when look-at orientation fights translation.
+    approach_coarse_look_at: bool = False
+    approach_coarse_ik_orientation_weight: float = 0.0
+    # Scale down bbox gaze while still far in depth so wrist/pan do not fight IK.
+    approach_gaze_scale_coarse: float = 0.35
     approach_coarse_max_ang_vel_deg_s: float = 45.0
     # While SEARCH is sweeping, nudge pan/wrist toward a live detection.
     search_detection_gaze_scale: float = 0.65
@@ -287,6 +298,45 @@ class GazeEngineConfig:
     search_sweep_suppress_when_detected: bool = True
     # After track loss (no reacquire pose): hold still before sweeping again.
     search_loss_goto_hold: bool = True
+
+    # End-of-approach grasp: open → inch forward → current-sensed close → optional lift.
+    grasp_enable: bool = True
+    # When grasp is enabled, approach stops and GRASP starts at this range (not final_standoff_m).
+    grasp_trigger_standoff_m: float = 0.10
+    grasp_open_pct: float = 100.0
+    grasp_close_pct: float = 0.0
+    grasp_final_approach_m: float = 0.028
+    grasp_final_approach_along_optical: bool = True
+    # Clean hand-off to the (reliable) grasp inch: enter GRASP once the object is
+    # within this band ABOVE the trigger range *and* well centered, instead of
+    # waiting for the noisy forward servo to creep all the way to the exact range.
+    # The grasp inch then drives the remaining distance to under the trigger and closes.
+    grasp_trigger_band_m: float = 0.035
+    # Grasp-handoff centering is judged primarily on HORIZONTAL (pan) error. Total
+    # pixel error includes vertical parallax (camera looks down → object sits low in
+    # frame), which the wrist often cannot null out (joint limit) and which does NOT
+    # block a grasp, since the inch drives along the optical axis. So the pixel cap is
+    # generous and pan is the real gate.
+    grasp_center_pixel_err_px: float = 70.0
+    grasp_center_pan_err_px: float = 22.0
+    # Stall hand-off: the inline APPROACHING IK can freeze a few cm short (5-DoF arm
+    # cannot reconfigure to translate the camera further). If filtered depth fails to
+    # improve by > stall_min_progress_m over stall_ticks consecutive ticks while the
+    # bbox is roughly centered, hand off to the (reliable) grasp inch which drives the
+    # measured remaining distance with a low-orientation-weight Cartesian nudge.
+    grasp_stall_ticks: int = 18
+    grasp_stall_min_progress_m: float = 0.004
+    # Drive the grasp inch by the *measured* camera→object distance instead of a fixed
+    # length: inch = clip(d_filt - grasp_final_gap_m, 0, grasp_max_inch_m). This is what
+    # actually gets the gripper under 10 cm regardless of where the approach stalled.
+    grasp_inch_from_measured_depth: bool = True
+    grasp_final_gap_m: float = 0.045
+    grasp_max_inch_m: float = 0.12
+    grasp_contact_delta_current_counts: float = 40.0
+    grasp_min_contact_grip_pct: float = 6.0
+    grasp_post_contact_squeeze_pct: float = 8.0
+    grasp_lift_confirm: bool = True
+    grasp_lift_height_m: float = 0.05
 
     # Live tuning (stdin and/or append-only file). Each non-empty line is a command.
     # Stdin: enable with ``live_control_stdin=True`` (type lines + Enter in the same
@@ -471,6 +521,8 @@ def _init_live_runtime(cfg: GazeEngineConfig) -> dict:
         "_preposition_enter_t": None,
         "_held_det": None,
         "_det_hold_used": 0,
+        "_grasp_done": False,
+        "_grasp_hold_pct": None,
     }
 
 
@@ -1058,7 +1110,35 @@ def _pan_align_required(cfg: GazeEngineConfig) -> bool:
 
 
 def _states_hold_detection() -> tuple[str, ...]:
-    return ("PAN_ALIGN", "APPROACHING", "PREPOSITIONING", "HOLD", "TRACKING")
+    return ("PAN_ALIGN", "APPROACHING", "PREPOSITIONING", "HOLD", "TRACKING", "GRASP")
+
+
+def _approach_target_standoff_m(cfg: GazeEngineConfig, live: dict) -> float:
+    """Range at which APPROACHING ends (and GRASP starts if enabled)."""
+    if bool(getattr(cfg, "grasp_enable", False)):
+        return float(getattr(cfg, "grasp_trigger_standoff_m", 0.10))
+    return float(live["standoff"])
+
+
+def _grasp_cfg_from_gaze(cfg: GazeEngineConfig) -> GraspCloseConfig:
+    return GraspCloseConfig(
+        enable=bool(getattr(cfg, "grasp_enable", True)),
+        open_pct=float(getattr(cfg, "grasp_open_pct", 100.0)),
+        close_pct=float(getattr(cfg, "grasp_close_pct", 0.0)),
+        final_approach_m=float(getattr(cfg, "grasp_final_approach_m", 0.028)),
+        final_approach_along_optical=bool(
+            getattr(cfg, "grasp_final_approach_along_optical", True)
+        ),
+        contact_delta_current_counts=float(
+            getattr(cfg, "grasp_contact_delta_current_counts", 40.0)
+        ),
+        min_contact_grip_pct=float(getattr(cfg, "grasp_min_contact_grip_pct", 6.0)),
+        post_contact_squeeze_pct=float(
+            getattr(cfg, "grasp_post_contact_squeeze_pct", 8.0)
+        ),
+        lift_confirm=bool(getattr(cfg, "grasp_lift_confirm", True)),
+        lift_height_m=float(getattr(cfg, "grasp_lift_height_m", 0.05)),
+    )
 
 
 def _apply_detection_hold(
@@ -1146,7 +1226,18 @@ def _should_pause_approach_forward(
     vertical_err_px: float = 0.0,
     cfg: GazeEngineConfig,
 ) -> bool:
-    """Pause translation when off-center so joint gaze (wrist) can catch up."""
+    """Pause translation when off-center so joint gaze (wrist) can catch up.
+
+    Crucially, while still far from the standoff (large positive depth_err) we do
+    **not** pause for vertical parallax: a top-down camera always sees the object
+    below image center, so an unconditional vertical gate stalls the approach a few
+    cm short. Only fine-center (pause) once we are near the target range.
+    """
+    far_from_standoff = depth_err_m is not None and float(depth_err_m) > float(
+        getattr(cfg, "approach_pause_max_depth_err_m", 0.048)
+    )
+    if far_from_standoff:
+        return False
     v_gate = float(getattr(cfg, "approach_pause_vertical_err_px", 0.0))
     if v_gate > 0.0 and abs(float(vertical_err_px)) >= v_gate:
         return True
@@ -1832,11 +1923,12 @@ def _approach_q(
     T_ik = T_target
 
     q_new = None
-    ow0 = float(
-        ik_orientation_weight
-        if ik_orientation_weight is not None
-        else cfg.ik_orientation_weight
-    )
+    if coarse_approach and not bool(getattr(cfg, "approach_coarse_look_at", False)):
+        ow0 = 0.0
+    elif ik_orientation_weight is not None:
+        ow0 = float(ik_orientation_weight)
+    else:
+        ow0 = float(cfg.ik_orientation_weight)
     for ow in (ow0, 0.15, 0.0):
         try:
             q_new = kin.inverse_kinematics(
@@ -2041,6 +2133,13 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
         bool(getattr(cfg, "preposition_from_search", False)),
         float(cfg.preposition_emergency_gaze_pixel_threshold_px),
         float(cfg.ik_object_floor_z_m),
+    )
+    logger.info(
+        "[gaze-engine] grasp=%s trigger=%.3fm final_inch=%.3fm lift_confirm=%s",
+        bool(getattr(cfg, "grasp_enable", True)),
+        float(getattr(cfg, "grasp_trigger_standoff_m", 0.10)),
+        float(getattr(cfg, "grasp_final_approach_m", 0.028)),
+        bool(getattr(cfg, "grasp_lift_confirm", True)),
     )
 
     i_pan = ARM_MOTORS.index("shoulder_pan")
@@ -2607,6 +2706,154 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 continue
             miss_streak = 0
 
+            p_obj_for_state: np.ndarray | None = None
+            d_geom = _depth_for_geometry(d_filt, d_bbox, cfg)
+            if d_geom is not None and uv is not None:
+                try:
+                    p_obj_for_state = point_cam_to_base(
+                        T_base_cam_cur,
+                        u=float(uv[0]),
+                        v_pix=float(uv[1]),
+                        depth_m=float(d_geom),
+                        fx=fx,
+                        fy=fy,
+                        cx0=cx0,
+                        cy0=cy0,
+                    )
+                except Exception:
+                    p_obj_for_state = None
+            p_obj_for_state = _maybe_floor_object_base(
+                p_obj_for_state, float(cfg.ik_object_floor_z_m)
+            )
+
+            if state == "GRASP" and not bool(live.get("_grasp_done", False)):
+                live["_grasp_done"] = True
+                grasp_motion = MotionExecutionConfig(
+                    cartesian_step_m=0.006,
+                    inter_step_sleep_s=0.03,
+                    ik_orientation_weight=0.02,
+                )
+                grasp_cfg = _grasp_cfg_from_gaze(cfg)
+                # Drive the inch by the *measured* camera→object distance so the
+                # gripper actually reaches the object (closes the last few cm that the
+                # approach servo could not), instead of a fixed length.
+                if bool(getattr(cfg, "grasp_inch_from_measured_depth", True)) and (
+                    d_filt is not None
+                ):
+                    gap = float(getattr(cfg, "grasp_final_gap_m", 0.045))
+                    max_inch = float(getattr(cfg, "grasp_max_inch_m", 0.12))
+                    inch = float(np.clip(float(d_filt) - gap, 0.0, max_inch))
+                    grasp_cfg.final_approach_m = inch
+                    # Drive along the camera optical axis: by construction it points at
+                    # the centered object, so the move reduces range without the "dive"
+                    # risk of aiming at a (possibly floored) back-projected point.
+                    grasp_cfg.final_approach_along_optical = True
+                    logger.info(
+                        "[gaze-engine] grasp inch sized from depth: d=%.3fm gap=%.3fm "
+                        "→ inch=%.3fm (along optical +Z)",
+                        float(d_filt),
+                        gap,
+                        inch,
+                    )
+                # Keep the Rerun view live during the (blocking) grasp by pumping a
+                # fresh camera + robot-pose frame on a throttled schedule.
+                def _grasp_rerun_pump(
+                    _label: str = active_query_label,
+                ) -> None:
+                    if not (cfg.display_data or cfg.display_sim3d):
+                        return
+                    now = time.time()
+                    last = float(live.get("_grasp_pump_t", 0.0))
+                    if now - last < 0.066:  # ~15 Hz cap
+                        return
+                    live["_grasp_pump_t"] = now
+                    try:
+                        obs_g = robot.get_observation()
+                        rgb_g = obs_g.get(cfg.camera_key)
+                        depth_g = obs_g.get(f"{cfg.camera_key}_depth")
+                        joints_g = np.array(
+                            [float(obs_g[f"{m}.pos"]) for m in ARM_MOTORS],
+                            dtype=np.float64,
+                        )
+                        T_base_ee_g = np.asarray(
+                            kin.forward_kinematics(joints_g), dtype=np.float64
+                        )
+                        T_base_cam_g = T_base_ee_g @ T_ee_cam
+                        # Re-run detection so the bbox keeps drawing during the grasp.
+                        bbox_g = None
+                        uv_g = None
+                        conf_g = 0.0
+                        d_bbox_g = None
+                        if rgb_g is not None:
+                            try:
+                                det_g = detector.best_detection(np.asarray(rgb_g))
+                                bbox_g, uv_g, conf_g, det_ok_g = _parse_yolo_detection(
+                                    det_g, cfg, in_search=False
+                                )
+                                if not det_ok_g:
+                                    bbox_g, uv_g, conf_g = None, None, 0.0
+                                if bbox_g is not None:
+                                    _, d_bbox_g, _ = _measure_object_depth_m(
+                                        depth_map=depth_g,
+                                        bbox_xyxy=bbox_g,
+                                        fx=fx,
+                                        fy=fy,
+                                        cfg=cfg,
+                                        depth_scale=float(
+                                            intrinsics.get("depth_scale", 0.001)
+                                        ),
+                                    )
+                            except Exception:
+                                bbox_g, uv_g, conf_g, d_bbox_g = None, None, 0.0, None
+                        _rerun_log(
+                            cfg=cfg,
+                            frame=tick,
+                            rgb=rgb_g,
+                            depth=depth_g,
+                            bbox_xyxy=bbox_g,
+                            uv=uv_g,
+                            cx0=cx0,
+                            cy0=cy0,
+                            conf=conf_g,
+                            phase="grasp",
+                            depth_m=d_bbox_g,
+                            kin=kin,
+                            joints_deg=joints_g,
+                            T_base_ee=T_base_ee_g,
+                            T_base_cam=T_base_cam_g,
+                            p_obj_base=p_obj_for_state,
+                            semantic_label=_label,
+                        )
+                    except Exception:
+                        pass
+
+                outcome = run_grasp_sequence(
+                    robot=robot,
+                    kin=kin,
+                    motor_names=ARM_MOTORS,
+                    T_base_cam=T_base_cam_cur,
+                    cfg=grasp_cfg,
+                    object_size_m=float(cfg.target_physical_size_m),
+                    motion=grasp_motion,
+                    p_obj_base=p_obj_for_state,
+                    on_tick=_grasp_rerun_pump,
+                )
+                if outcome.grip_pct_at_contact is not None:
+                    live["_grasp_hold_pct"] = float(outcome.grip_pct_at_contact)
+                elif outcome.contact_detected:
+                    live["_grasp_hold_pct"] = float(
+                        getattr(cfg, "grasp_close_pct", 0.0)
+                    )
+                logger.info(
+                    "[gaze-engine] GRASP→HOLD success=%s (%s)",
+                    outcome.success,
+                    outcome.message,
+                )
+                state = "HOLD"
+                prev_state = "GRASP"
+                _sleep(loop_t, dt_target)
+                continue
+
             gaze_uv = _filter_bbox_uv(
                 live,
                 (float(uv[0]), float(uv[1])),
@@ -2640,7 +2887,8 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 if pixel_err < float(cfg.approach_pixel_threshold_px):
                     pan_mult = float(cfg.gaze_pan_scale_when_aligned)
             d_pan = float(d_pan) * float(pan_mult)
-            depth_err_m = _depth_err_m(d_filt, float(live["standoff"]))
+            approach_target_m = _approach_target_standoff_m(cfg, live)
+            depth_err_m = _depth_err_m(d_filt, approach_target_m)
             pan_err_px = _pan_horizontal_err_px(gaze_uv, cx0)
             pan_aligned = _is_pan_aligned(gaze_uv, cx0, cfg)
             motion_live = _live_motion_override_active(live, loop_t)
@@ -2694,6 +2942,12 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     d_pan = float(d_pan) * float(
                         getattr(cfg, "gaze_scale_during_approach", 1.0)
                     )
+                    if depth_err_m is not None and float(depth_err_m) > float(
+                        cfg.fine_gaze_depth_err_m
+                    ):
+                        gsc = float(getattr(cfg, "approach_gaze_scale_coarse", 0.35))
+                        d_pan = float(d_pan) * gsc
+                        d_tilt = float(d_tilt) * gsc
 
             # Default action: gaze deltas only (used by TRACKING and HOLD)
             q_cmd = joints.copy()
@@ -2708,28 +2962,6 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
             approach_step_m = 0.0
             approach_fov_scale = 1.0
             preposition_pos_err_m = float("nan")
-
-            # Back-project bbox center with bbox-size depth into base frame —
-            # used by PREPOSITIONING as p_obj, and by viz for everyone.
-            p_obj_for_state: np.ndarray | None = None
-            d_geom = _depth_for_geometry(d_filt, d_bbox, cfg)
-            if d_geom is not None and uv is not None:
-                try:
-                    p_obj_for_state = point_cam_to_base(
-                        T_base_cam_cur,
-                        u=float(uv[0]),
-                        v_pix=float(uv[1]),
-                        depth_m=float(d_geom),
-                        fx=fx,
-                        fy=fy,
-                        cx0=cx0,
-                        cy0=cy0,
-                    )
-                except Exception:
-                    p_obj_for_state = None
-            p_obj_for_state = _maybe_floor_object_base(
-                p_obj_for_state, float(cfg.ik_object_floor_z_m)
-            )
 
             if state == "TRACKING":
                 if live.get("_tracking_enter_t") is None:
@@ -3002,11 +3234,16 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                                 base * 1.75,
                             )
                         if coarse_apr:
-                            apr_ow = float(
-                                getattr(
-                                    cfg, "approach_coarse_ik_orientation_weight", 0.45
+                            if bool(getattr(cfg, "approach_coarse_look_at", False)):
+                                apr_ow = float(
+                                    getattr(
+                                        cfg,
+                                        "approach_coarse_ik_orientation_weight",
+                                        0.0,
+                                    )
                                 )
-                            )
+                            else:
+                                apr_ow = 0.0
                             apr_dq = max(
                                 float(apr_dq)
                                 if apr_dq is not None
@@ -3041,7 +3278,7 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                             cfg=cfg,
                             dt=dt_target,
                             kin=kin,
-                            final_standoff_m=float(live["standoff"]),
+                            final_standoff_m=float(approach_target_m),
                             max_lin_vel_m_s=apr_lin,
                             max_joint_step_deg=apr_dq,
                             fov_scale_min=apr_fov_min,
@@ -3052,24 +3289,105 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                         )
                         approach_step_m = float(planned_step)
                         approach_fov_scale = float(fov_scale)
+                        if q_apr is not None and planned_step > 1e-5 and not pause_fwd:
+                            dq_peak = float(
+                                np.max(np.abs(q_apr - np.asarray(joints, dtype=np.float64)))
+                            )
+                            if dq_peak < 0.08:
+                                q_retry, step_retry, fov_retry = _approach_q(
+                                    joints_deg=joints,
+                                    T_base_ee_cur=T_base_ee_cur,
+                                    T_base_cam_cur=T_base_cam_cur,
+                                    d_obj_m=float(d_cmd),
+                                    p_obj_base=p_obj_for_state,
+                                    pixel_err_px=float(pixel_err),
+                                    pan_err_px=float(pan_err_px),
+                                    vertical_err_px=float(vertical_err_px),
+                                    cfg=cfg,
+                                    dt=dt_target,
+                                    kin=kin,
+                                    final_standoff_m=float(approach_target_m),
+                                    max_lin_vel_m_s=apr_lin,
+                                    max_joint_step_deg=apr_dq,
+                                    fov_scale_min=apr_fov_min,
+                                    ik_orientation_weight=0.0,
+                                    coarse_approach=True,
+                                    T_ee_cam=T_ee_cam,
+                                    pause_forward=False,
+                                )
+                                if q_retry is not None:
+                                    dq_retry = float(
+                                        np.max(
+                                            np.abs(
+                                                q_retry
+                                                - np.asarray(joints, dtype=np.float64)
+                                            )
+                                        )
+                                    )
+                                    if dq_retry > dq_peak + 0.02:
+                                        q_apr = q_retry
+                                        approach_step_m = float(step_retry)
+                                        approach_fov_scale = float(fov_retry)
                         if q_apr is not None:
                             q_cmd = q_apr
-                        at_standoff = (
-                            abs(float(d_filt) - float(live["standoff"]))
-                            < float(cfg.approach_done_tolerance_m)
-                        )
-                        centered_ok = _approach_centering_ok(
-                            pixel_err_px=float(pixel_err),
-                            depth_err_m=depth_err_m,
-                            cfg=cfg,
-                        )
-                        if at_standoff and (
-                            not bool(
-                                getattr(cfg, "approach_require_centered_for_done", True)
+                        if bool(getattr(cfg, "grasp_enable", False)):
+                            # Clean rule: approach + center to *roughly* the trigger
+                            # range, then hand off to the reliable grasp inch (which
+                            # drives the last cm under the trigger and closes). The
+                            # forward servo can't reliably creep the final ~1.5 cm, so
+                            # we don't wait for an exact range — we require the object
+                            # to be near AND centered, then grasp.
+                            band = float(getattr(cfg, "grasp_trigger_band_m", 0.035))
+                            near = float(d_filt) <= float(approach_target_m) + band
+                            centered_for_grasp = (
+                                float(pixel_err)
+                                <= float(getattr(cfg, "grasp_center_pixel_err_px", 34.0))
+                                and float(pan_err_px)
+                                <= float(getattr(cfg, "grasp_center_pan_err_px", 22.0))
                             )
-                            or centered_ok
-                        ):
-                            approach_done = True
+                            # Stall detector: track best (smallest) depth seen this
+                            # APPROACHING episode; if it fails to improve while the arm
+                            # keeps commanding forward steps, the IK is stuck — hand off
+                            # to the grasp inch rather than freezing forever.
+                            best_d = live.get("_approach_best_d")
+                            if best_d is None or float(d_filt) < float(best_d) - float(
+                                getattr(cfg, "grasp_stall_min_progress_m", 0.004)
+                            ):
+                                live["_approach_best_d"] = float(d_filt)
+                                live["_approach_stall_ticks"] = 0
+                            else:
+                                live["_approach_stall_ticks"] = (
+                                    int(live.get("_approach_stall_ticks", 0)) + 1
+                                )
+                            stalled = int(
+                                live.get("_approach_stall_ticks", 0)
+                            ) >= int(getattr(cfg, "grasp_stall_ticks", 18))
+                            if centered_for_grasp and (near or stalled):
+                                if stalled and not near:
+                                    logger.info(
+                                        "[gaze-engine] approach stalled at d=%.3fm "
+                                        "(no progress %d ticks) — handing off to grasp inch",
+                                        float(d_filt),
+                                        int(live.get("_approach_stall_ticks", 0)),
+                                    )
+                                approach_done = True
+                        else:
+                            at_standoff = (
+                                abs(float(d_filt) - float(approach_target_m))
+                                < float(cfg.approach_done_tolerance_m)
+                            )
+                            centered_ok = _approach_centering_ok(
+                                pixel_err_px=float(pixel_err),
+                                depth_err_m=depth_err_m,
+                                cfg=cfg,
+                            )
+                            if at_standoff and (
+                                not bool(
+                                    getattr(cfg, "approach_require_centered_for_done", True)
+                                )
+                                or centered_ok
+                            ):
+                                approach_done = True
 
             elif state == "HOLD":
                 # Maintain gaze, no forward motion
@@ -3080,7 +3398,9 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
 
             q_out = _apply_live_joint_trims(cfg, live, q_cmd)
             act = {f"{m}.pos": float(q_out[i]) for i, m in enumerate(ARM_MOTORS)}
-            if "gripper.pos" in obs:
+            if live.get("_grasp_hold_pct") is not None:
+                act["gripper.pos"] = float(live["_grasp_hold_pct"])
+            elif "gripper.pos" in obs:
                 act["gripper.pos"] = float(obs["gripper.pos"])
             try:
                 robot.send_action(act)
@@ -3113,13 +3433,21 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                     )
                 )
                 if at_depth:
-                    logger.info(
-                        "[gaze-engine] PREPOSITIONING→HOLD "
-                        "(pos_err=%.3fm, d=%.3fm at standoff)",
-                        preposition_pos_err_m,
-                        float(d_filt) if d_filt is not None else float("nan"),
-                    )
-                    state = "HOLD"
+                    if bool(getattr(cfg, "grasp_enable", True)):
+                        logger.info(
+                            "[gaze-engine] PREPOSITIONING→GRASP "
+                            "(at standoff d=%.3fm)",
+                            float(d_filt) if d_filt is not None else float("nan"),
+                        )
+                        state = "GRASP"
+                    else:
+                        logger.info(
+                            "[gaze-engine] PREPOSITIONING→HOLD "
+                            "(pos_err=%.3fm, d=%.3fm at standoff)",
+                            preposition_pos_err_m,
+                            float(d_filt) if d_filt is not None else float("nan"),
+                        )
+                        state = "HOLD"
                 elif need_center:
                     logger.info(
                         "[gaze-engine] PREPOSITIONING→TRACKING "
@@ -3211,17 +3539,26 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 live["_tracking_enter_t"] = float(loop_t)
                 live["_uv_filt"] = None
             elif approach_done:
-                logger.info(
-                    "[gaze-engine] APPROACHING→HOLD (d=%.3fm within %.3fm of target)",
-                    float(d_filt) if d_filt is not None else float("nan"),
-                    float(cfg.approach_done_tolerance_m),
-                )
-                state = "HOLD"
+                if bool(getattr(cfg, "grasp_enable", True)):
+                    logger.info(
+                        "[gaze-engine] APPROACHING→GRASP (d=%.3fm, starting grasp)",
+                        float(d_filt) if d_filt is not None else float("nan"),
+                    )
+                    state = "GRASP"
+                else:
+                    logger.info(
+                        "[gaze-engine] APPROACHING→HOLD (d=%.3fm within %.3fm of target)",
+                        float(d_filt) if d_filt is not None else float("nan"),
+                        float(cfg.approach_done_tolerance_m),
+                    )
+                    state = "HOLD"
 
             if state == "APPROACHING" and prev_state != "APPROACHING":
                 _reset_approach_depth_filter(live, d_bbox=d_bbox)
                 live["_approach_enter_t"] = float(loop_t)
                 live["_pan_regress_streak"] = 0
+                live["_approach_best_d"] = None
+                live["_approach_stall_ticks"] = 0
                 if gaze_uv is not None:
                     live["_approach_uv_lock"] = (
                         float(gaze_uv[0]),
@@ -3230,7 +3567,7 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
             prev_state = state
 
             if tick % log_every_n == 0:
-                d_tgt = float(live["standoff"])
+                d_tgt = float(_approach_target_standoff_m(cfg, live))
                 d_meas = float(d_filt) if d_filt is not None else float("nan")
                 depth_err = (
                     float(d_meas - d_tgt)
