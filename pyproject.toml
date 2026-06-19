@@ -126,7 +126,15 @@ intelrealsense = [
     "pyrealsense2-macosx>=2.54,<2.55.0 ; sys_platform == 'darwin'",
 ]
 oakd = ["depthai>=2.25.0.0"]
+foundation-stereo = ["omegaconf>=2.3.0,<3.0.0"]
 realsense-mesh = ["lerobot[intelrealsense]", "open3d>=0.18.0,<0.20.0"]
+vision-nav = [
+    "lerobot[oakd]",
+    "lerobot[transformers-dep]",
+    "open3d>=0.18.0,<0.20.0",
+    "ultralytics>=8.3.0,<9.0.0",
+]
+yolo-world = ["ultralytics>=8.3.0,<9.0.0"]
 perception = [
     "lerobot[transformers-dep]",
     "lerobot[kinematics]",
@@ -236,6 +244,15 @@ lerobot-localize-objects="lerobot.scripts.lerobot_localize_objects:main"
 lerobot-track-tags="lerobot.scripts.lerobot_track_tags:main"
 lerobot-make-tag="lerobot.scripts.lerobot_make_tag:main"
 lerobot-gaze-engine="lerobot.scripts.lerobot_gaze_engine:main"
+lerobot-simple-grasp-engine="lerobot.scripts.lerobot_simple_grasp_engine:main"
+lerobot-pbvs-engine="lerobot.scripts.lerobot_pbvs_engine:main"
+lerobot-lookat-engine="lerobot.scripts.lerobot_lookat_engine:main"
+lerobot-save-home="lerobot.scripts.lerobot_save_home:main"
+lerobot-fold-home="lerobot.scripts.lerobot_fold_home:main"
+lerobot-odyseus-oakd="lerobot.scripts.lerobot_odyseus_oakd:main"
+lerobot-vision-nav="lerobot.scripts.lerobot_vision_nav:main"
+lerobot-oakd-mesh="lerobot.scripts.lerobot_oakd_mesh:main"
+lerobot-oakd-mesh-live="lerobot.scripts.lerobot_oakd_mesh_live:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.package-data]
