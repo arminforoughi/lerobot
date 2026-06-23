@@ -87,12 +87,16 @@ class OAKDCamera(Camera):
         self._pipeline: Any | None = None  # dai.Pipeline
         self._color_queue: Any | None = None  # dai.MessageQueue
         self._depth_queue: Any | None = None  # dai.MessageQueue
+        self._left_queue: Any | None = None
+        self._right_queue: Any | None = None
 
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
         self.frame_lock: Lock = Lock()
         self.latest_color_frame: NDArray[Any] | None = None
         self.latest_depth_frame: NDArray[Any] | None = None
+        self.latest_left_frame: NDArray[Any] | None = None
+        self.latest_right_frame: NDArray[Any] | None = None
         self.latest_timestamp: float | None = None
         self.new_frame_event: Event = Event()
 
@@ -124,7 +128,11 @@ class OAKDCamera(Camera):
             found.append(
                 {
                     "type": "OAK-D",
-                    "id": dev_info.getMxId(),
+                    "id": (
+                        dev_info.getDeviceId()
+                        if hasattr(dev_info, "getDeviceId")
+                        else dev_info.getMxId()
+                    ),
                     "name": dev_info.name,
                     "state": dev_info.state.name,
                     "protocol": dev_info.protocol.name if hasattr(dev_info, "protocol") else "unknown",
@@ -164,8 +172,10 @@ class OAKDCamera(Camera):
         # Keep only the most recent frame to reduce stale RGB/depth pairing.
         self._color_queue = rgb_out.createOutputQueue(maxSize=1, blocking=False)
 
-        # ---- Stereo depth (optional) ----
-        if self.use_depth:
+        export_stereo = bool(getattr(self.config, "export_stereo_rectified", False))
+
+        # ---- Stereo depth / rectified pair (optional) ----
+        if self.use_depth or export_stereo:
             left_cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
             right_cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
 
@@ -209,8 +219,13 @@ class OAKDCamera(Camera):
             left_out.link(stereo.left)
             right_out.link(stereo.right)
 
-            # Keep only the most recent depth frame to reduce stale RGB/depth pairing.
-            self._depth_queue = stereo.depth.createOutputQueue(maxSize=1, blocking=False)
+            if export_stereo:
+                self._left_queue = stereo.rectifiedLeft.createOutputQueue(maxSize=1, blocking=False)
+                self._right_queue = stereo.rectifiedRight.createOutputQueue(maxSize=1, blocking=False)
+
+            if self.use_depth:
+                # Keep only the most recent depth frame to reduce stale RGB/depth pairing.
+                self._depth_queue = stereo.depth.createOutputQueue(maxSize=1, blocking=False)
 
         self._pipeline = pipeline
         pipeline.start()
@@ -230,6 +245,12 @@ class OAKDCamera(Camera):
                     raise ConnectionError(f"{self} failed to capture frames during warmup.")
                 if self.use_depth and self.latest_depth_frame is None:
                     raise ConnectionError(f"{self} failed to capture depth frames during warmup.")
+                if export_stereo and (
+                    self.latest_left_frame is None or self.latest_right_frame is None
+                ):
+                    raise ConnectionError(
+                        f"{self} failed to capture rectified stereo frames during warmup."
+                    )
 
         logger.info(f"{self} connected.")
 
@@ -300,6 +321,54 @@ class OAKDCamera(Camera):
             "height": h,
             "depth_scale": depth_scale,
         }
+
+    @check_if_not_connected
+    def get_stereo_intrinsics(self) -> dict[str, float]:
+        """Left rectified camera intrinsics and baseline for external stereo depth (meters)."""
+        if self._left_queue is None:
+            raise RuntimeError(
+                "Rectified stereo not enabled. Set export_stereo_rectified=True on OAKDCameraConfig."
+            )
+        calib = self._device.readCalibration()
+        w = self.capture_width or 640
+        h = self.capture_height or 480
+        intrinsics_matrix = calib.getCameraIntrinsics(
+            dai.CameraBoardSocket.CAM_B,
+            w,
+            h,
+        )
+        fx = float(intrinsics_matrix[0][0])
+        fy = float(intrinsics_matrix[1][1])
+        cx = float(intrinsics_matrix[0][2])
+        cy = float(intrinsics_matrix[1][2])
+        baseline_m = float(calib.getBaselineDistance())
+        if self.rotation == cv2.ROTATE_90_CLOCKWISE:
+            fx, fy = fy, fx
+            cx, cy = h - 1 - cy, cx
+        elif self.rotation == cv2.ROTATE_90_COUNTERCLOCKWISE:
+            fx, fy = fy, fx
+            cx, cy = cy, w - 1 - cx
+        elif self.rotation == cv2.ROTATE_180:
+            cx, cy = w - 1 - cx, h - 1 - cy
+        return {"fx": fx, "fy": fy, "cx": cx, "cy": cy, "baseline_m": baseline_m}
+
+    @check_if_not_connected
+    def read_stereo_rectified(self, timeout_ms: int = 200) -> tuple[NDArray[Any], NDArray[Any]]:
+        """Latest rectified left/right pair (RGB or BGR per ``color_mode``)."""
+        if self._left_queue is None or self._right_queue is None:
+            raise RuntimeError(
+                "Rectified stereo not enabled. Set export_stereo_rectified=True on OAKDCameraConfig."
+            )
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError(f"{self} read thread is not running.")
+        self.new_frame_event.clear()
+        _ = self.async_read(timeout_ms=max(timeout_ms, 10000))
+        with self.frame_lock:
+            left = self.latest_left_frame
+            right = self.latest_right_frame
+        if left is None or right is None:
+            raise RuntimeError("No rectified stereo frames available yet.")
+        return left, right
 
     # ------------------------------------------------------------------
     # Read methods
@@ -427,14 +496,40 @@ class OAKDCamera(Camera):
                 processed_color = self._postprocess_image(color_frame)
 
                 processed_depth = None
+                processed_left = None
+                processed_right = None
+                need_stereo = self._left_queue is not None and self._right_queue is not None
                 if self.use_depth and self._depth_queue is not None:
                     depth_packet = _drain_latest_packet(self._depth_queue)
-                    if depth_packet is None:
-                        # Do not publish unsynchronized RGB-only updates when depth is enabled.
+                    if depth_packet is None and not need_stereo:
                         time.sleep(0.001)
                         continue
-                    depth_frame = depth_packet.getFrame()
-                    processed_depth = self._postprocess_image(depth_frame, is_depth=True)
+                    if depth_packet is not None:
+                        depth_frame = depth_packet.getFrame()
+                        processed_depth = self._postprocess_image(depth_frame, is_depth=True)
+
+                if need_stereo:
+                    left_packet = _drain_latest_packet(self._left_queue)
+                    right_packet = _drain_latest_packet(self._right_queue)
+                    if left_packet is None or right_packet is None:
+                        if self.use_depth and processed_depth is None:
+                            time.sleep(0.001)
+                            continue
+                    else:
+                        lf = left_packet.getCvFrame()
+                        rf = right_packet.getCvFrame()
+                        if lf.ndim == 2:
+                            lf = cv2.cvtColor(lf, cv2.COLOR_GRAY2BGR)
+                        if rf.ndim == 2:
+                            rf = cv2.cvtColor(rf, cv2.COLOR_GRAY2BGR)
+                        processed_left = self._postprocess_image(lf)
+                        processed_right = self._postprocess_image(rf)
+
+                if self.use_depth and processed_depth is None and not (
+                    need_stereo and processed_left is not None
+                ):
+                    time.sleep(0.001)
+                    continue
 
                 capture_time = time.perf_counter()
 
@@ -442,6 +537,10 @@ class OAKDCamera(Camera):
                     self.latest_color_frame = processed_color
                     if processed_depth is not None:
                         self.latest_depth_frame = processed_depth
+                    if processed_left is not None:
+                        self.latest_left_frame = processed_left
+                    if processed_right is not None:
+                        self.latest_right_frame = processed_right
                     self.latest_timestamp = capture_time
                 self.new_frame_event.set()
                 failure_count = 0
@@ -471,6 +570,8 @@ class OAKDCamera(Camera):
         with self.frame_lock:
             self.latest_color_frame = None
             self.latest_depth_frame = None
+            self.latest_left_frame = None
+            self.latest_right_frame = None
             self.latest_timestamp = None
             self.new_frame_event.clear()
 
@@ -499,10 +600,14 @@ class OAKDCamera(Camera):
 
         self._color_queue = None
         self._depth_queue = None
+        self._left_queue = None
+        self._right_queue = None
 
         with self.frame_lock:
             self.latest_color_frame = None
             self.latest_depth_frame = None
+            self.latest_left_frame = None
+            self.latest_right_frame = None
             self.latest_timestamp = None
             self.new_frame_event.clear()
 

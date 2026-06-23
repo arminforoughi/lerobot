@@ -1,0 +1,30 @@
+lerobot-yolo-track-approach \
+  --robot.type=so101_follower --robot.port=/dev/tty.usbmodem5A4B0479741 \
+  --robot.cameras='{"front": {"type": "oakd", "fps": 30, "width": 640, "height": 480, "use_depth": true}}' \
+  --urdf=./SO101/so101_new_calib.urdf \
+  --query="red cube" \
+  --model-path=./yolov8s-worldv2.pt \
+  --camera-mount=gripper \
+  --camera-frame-convention=opencv \
+  --gripper-camera-tf="0.04,0,0.02,0,-0.35,0" \
+  --target-from-gripper-tf=true \
+  --approach-style=plan_top \
+  --search-scan-enabled=true \
+  --depth-from-bbox-enabled=true \
+  --target-physical-size-m=0.03 \
+  --depth-source-policy=bbox_preferred \
+  --top-approach-height-m=0.05 \
+  --top-max-reach-m=0.35 \
+  --table-z-m=-0.02 \
+  --table-clearance-m=0.005 \
+  --plan-top-tilt-fraction=0.0 \
+  --plan-top-tilt-tolerance-deg=90 \
+  --plan-top-final-hover-m=0.05 \
+  --plan-top-gripper-tip-offset-m=0.02 \
+  --plan-top-center-enable=true \
+  --smooth-center-alpha=0.25 \
+  --plan-top-keep-in-frame-enable=true \
+  --plan-top-keep-in-frame-deadband-px=24 \
+  --plan-top-keep-in-frame-kp=0.40 \
+  --plan-top-keep-in-frame-max-step-deg=2.5 \
+  --show-window=true --display-data=true --display-sim3d=true

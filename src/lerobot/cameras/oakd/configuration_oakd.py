@@ -53,6 +53,8 @@ class OAKDCameraConfig(CameraConfig):
             to skip calling ``setConfidenceThreshold`` (SDK default).
         stereo_extended_disparity: Enable extended disparity for **closer** minimum range
             (needed for many eye-in-hand / near-table setups). Slightly more computation.
+        export_stereo_rectified: Expose rectified left/right mono frames from the stereo node
+            (for external depth, e.g. FoundationStereo). Can be used with ``use_depth=False``.
 
     Note:
         - Depth alignment to RGB requires left-right check to be enabled
@@ -68,6 +70,7 @@ class OAKDCameraConfig(CameraConfig):
     stereo_preset: str = "FAST_ACCURACY"
     stereo_confidence_threshold: int = 200
     stereo_extended_disparity: bool = False
+    export_stereo_rectified: bool = False
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
