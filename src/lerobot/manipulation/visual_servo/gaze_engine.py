@@ -29,6 +29,10 @@ State machine:
   PAN_ALIGN → shoulder_pan (j1) only until the bbox is centered in u; then approach.
   TRACKING  → gaze only until centered, then PAN_ALIGN or APPROACHING.
   APPROACHING → radial approach + look-at IK (blocked until PAN_ALIGN done).
+              With ``approach_top_descend`` it instead runs a smooth, rate-limited
+              LOOK-AT DESCENT: the camera comes down onto the object from a steep
+              vantage while the IK keeps the optical axis locked on the target, so
+              it never leaves the frame (vs. the radial slide drifting it to the edge).
   HOLD      → depth within tolerance of standoff; maintain gaze.
   GRASP     → open gripper, final approach, close with current sensing, then HOLD.
 
@@ -52,6 +56,7 @@ import numpy as np
 
 from lerobot.cameras.oakd.configuration_oakd import OAKDCameraConfig  # noqa: F401
 from lerobot.configs import parser
+from lerobot.manipulation.home_position import HomeFoldController, home_settings_from_config
 from lerobot.manipulation.visual_servo.cvs_engine import (
     _se3_rate_limited_step,
     approach_unit_vector,
@@ -242,6 +247,41 @@ class GazeEngineConfig:
     approach_gaze_uv_ema_alpha: float = 0.38
     # Reject bbox-center jumps larger than this (px/tick) — YOLO flicker.
     gaze_uv_max_step_px: float = 45.0
+
+    # --- Top-down look-at descent (smooth approach from above while pointing) ---
+    # When True, APPROACHING follows a rate-limited LOOK-AT descent instead of the
+    # radial/optical `_approach_q` slide: every tick the camera is driven toward a
+    # point ``final_standoff`` from the object at a steep ``approach_top_el_deg``
+    # vantage, with the optical axis LOCKED onto the object (look-at IK). Because
+    # pointing is enforced in the IK target — not just reactively by the gaze loop —
+    # the object stays centered in frame the whole way down instead of sliding to
+    # the edge as the gripper comes in obliquely on the 5-DoF arm. Gaze (pan/tilt)
+    # still runs on top for fine centering, and the grasp hand-off is unchanged.
+    approach_top_descend: bool = False
+    # Vantage elevation for the descent target (deg above the table plane). 90 is
+    # straight down; 65–75 is a steep oblique the SO-101 can actually reach while
+    # still looking down onto the object.
+    approach_top_el_deg: float = 70.0
+    # Auto azimuth: descend from the side the arm is ALREADY on (minimal horizontal
+    # swing, so the object never whips out of frame). Set False to force a fixed
+    # ``approach_top_az_deg`` instead.
+    approach_top_az_auto: bool = True
+    approach_top_az_deg: float = 0.0
+    # Rate limits for the descent SE(3) step — these are the smoothness knobs.
+    # Lower = smoother / slower, less shake.
+    approach_top_max_lin_vel_m_s: float = 0.035
+    approach_top_max_ang_vel_deg_s: float = 40.0
+    approach_top_max_joint_step_deg: float = 2.5
+    # Look-at orientation weight for the descent IK (how hard the solver keeps the
+    # camera pointed at the object). 0.4–0.8 keeps the target centered without the
+    # wrist fighting the translation.
+    approach_top_ik_orientation_weight: float = 0.6
+    # EMA on the back-projected object point (base frame) during the descent so a
+    # jittery bbox/depth does not shake the commanded pose. 1.0 = no smoothing.
+    approach_top_obj_ema_alpha: float = 0.25
+    # Output joint slew cap (deg/tick) applied to the FINAL command (after gaze)
+    # while descending — kills residual per-tick shake from detector noise. 0 off.
+    approach_top_output_slew_deg: float = 3.0
 
     # Gaze (P-control on pixel error → joint deltas, no IK)
     gaze_kp_pan: float = 0.32
@@ -484,6 +524,13 @@ class GazeEngineConfig:
     display_sim3d: bool = False
     log_every_n: int = 0
 
+    # Home / fold-back
+    home_config_path: str = "SO101/so101_home.yaml"
+    fold_home_on_interrupt: bool = True
+    live_home_keypress: bool = True
+    home_joint_step_deg: float = 1.5
+    home_inter_step_sleep_s: float = 0.04
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -517,6 +564,7 @@ def _init_live_runtime(cfg: GazeEngineConfig) -> dict:
         "_termios_old": None,
         "_stdin_keypress": False,
         "_uv_filt": None,
+        "_top_obj_filt": None,
         "_tracking_enter_t": None,
         "_preposition_enter_t": None,
         "_held_det": None,
@@ -922,6 +970,8 @@ def _drain_live_keypress(cfg: GazeEngineConfig, live: dict) -> None:
             want_preposition = True
         elif c == ord("?"):
             want_help = True
+        elif c in (ord("h"), ord("H")):
+            live["_fold_home"] = True
         i += 1
 
     live["_kb_buf"] = bytes(buf[i:])
@@ -1958,6 +2008,81 @@ def _approach_q(
     return q_new, step, float(fov_scale)
 
 
+def _top_descend_q(
+    *,
+    joints_deg: np.ndarray,
+    T_base_ee_cur: np.ndarray,
+    T_base_cam_cur: np.ndarray,
+    T_ee_cam: np.ndarray,
+    p_obj_base: np.ndarray,
+    standoff_m: float,
+    cfg: GazeEngineConfig,
+    dt: float,
+    kin,
+    live: dict,
+) -> tuple[np.ndarray | None, np.ndarray, float]:
+    """Smooth look-at descent: drive the camera to a steep vantage ``standoff_m``
+    from the object and KEEP the optical axis pointed at it the whole way down.
+
+    This is the "approach from the top while pointing at the object" step. Unlike
+    the radial/optical ``_approach_q`` (which slides the bbox toward the image edge
+    when the 5-DoF arm comes in obliquely), the target pose here is a look-at at a
+    near-top elevation, rate-limited for smoothness, so the object stays centered as
+    the gripper descends. Reuses ``_preposition_q`` (look-at + SE(3) rate limiting)
+    with the orbit radius pinned to the final standoff and a steep elevation.
+
+    The object point is EMA-smoothed (``approach_top_obj_ema_alpha``) so detector
+    jitter does not shake the commanded pose. With ``approach_top_az_auto`` the
+    descent comes from whichever side the arm is already on, minimizing the
+    horizontal swing that would otherwise whip the target out of frame.
+
+    Returns ``(q_new, p_eye_target, pos_err_m)`` (q_new is None on IK failure).
+    """
+    p_obj = np.asarray(p_obj_base, dtype=np.float64).reshape(3)
+    alpha = float(
+        np.clip(float(getattr(cfg, "approach_top_obj_ema_alpha", 0.25)), 0.05, 1.0)
+    )
+    prev = live.get("_top_obj_filt")
+    if prev is None:
+        p_obj_s = p_obj.copy()
+    else:
+        p_obj_s = (1.0 - alpha) * np.asarray(prev, dtype=np.float64) + alpha * p_obj
+    live["_top_obj_filt"] = p_obj_s.copy()
+
+    el = float(getattr(cfg, "approach_top_el_deg", 70.0))
+    if bool(getattr(cfg, "approach_top_az_auto", True)):
+        eye_cur = np.asarray(T_base_cam_cur[:3, 3], dtype=np.float64)
+        hx = float(eye_cur[0] - p_obj_s[0])
+        hy = float(eye_cur[1] - p_obj_s[1])
+        if math.hypot(hx, hy) < 1e-4:
+            az = float(getattr(cfg, "approach_top_az_deg", 0.0))
+        else:
+            # n_hat horizontal ∝ [-cos(az), sin(az)] (see approach_unit_vector).
+            az = math.degrees(math.atan2(hy, -hx))
+    else:
+        az = float(getattr(cfg, "approach_top_az_deg", 0.0))
+
+    return _preposition_q(
+        joints_deg=joints_deg,
+        T_base_ee_cur=T_base_ee_cur,
+        T_ee_cam=T_ee_cam,
+        p_obj_base=p_obj_s,
+        cfg=cfg,
+        dt=dt,
+        kin=kin,
+        approach_az_deg=az,
+        approach_el_deg=el,
+        preposition_radius_m=float(standoff_m),
+        max_lin_vel_m_s=float(getattr(cfg, "approach_top_max_lin_vel_m_s", 0.035)),
+        max_joint_step_deg=float(getattr(cfg, "approach_top_max_joint_step_deg", 2.5)),
+        max_ang_vel_deg_s=float(getattr(cfg, "approach_top_max_ang_vel_deg_s", 40.0)),
+        ik_orientation_weight=float(
+            getattr(cfg, "approach_top_ik_orientation_weight", 0.6)
+        ),
+        snap_se3=False,
+    )
+
+
 def _try_init_rerun(cfg: GazeEngineConfig) -> bool:
     if not (cfg.display_data or cfg.display_sim3d):
         return False
@@ -2241,6 +2366,11 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
         search_seed = None
 
     comm_errors = 0
+    home_ctrl = HomeFoldController(home_settings_from_config(cfg), ARM_MOTORS)
+    if not (bool(getattr(cfg, "live_control_keypress", False)) and bool(cfg.live_control_stdin)):
+        home_ctrl.setup_standalone_keypress()
+    home_ctrl.log_status()
+    interrupted = False
     try:
         while True:
             loop_t = time.time()
@@ -2338,6 +2468,12 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                         )
 
             _drain_live_commands(cfg, live)
+            if live.pop("_fold_home", False):
+                home_ctrl.fold_requested = True
+            home_ctrl.poll_standalone()
+            if home_ctrl.fold_requested and not home_ctrl.folded:
+                home_ctrl.execute_fold(robot)
+                break
             _live_slew_orbit_targets(live, cfg, dt)
             if live.get("_goto_preposition", False):
                 if not bool(cfg.preposition_enabled):
@@ -3266,27 +3402,50 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                                 else float("nan")
                             )
                         )
-                        q_apr, planned_step, fov_scale = _approach_q(
-                            joints_deg=joints,
-                            T_base_ee_cur=T_base_ee_cur,
-                            T_base_cam_cur=T_base_cam_cur,
-                            d_obj_m=float(d_cmd),
-                            p_obj_base=p_obj_for_state,
-                            pixel_err_px=float(pixel_err),
-                            pan_err_px=float(pan_err_px),
-                            vertical_err_px=float(vertical_err_px),
-                            cfg=cfg,
-                            dt=dt_target,
-                            kin=kin,
-                            final_standoff_m=float(approach_target_m),
-                            max_lin_vel_m_s=apr_lin,
-                            max_joint_step_deg=apr_dq,
-                            fov_scale_min=apr_fov_min,
-                            ik_orientation_weight=apr_ow,
-                            coarse_approach=bool(coarse_apr),
-                            T_ee_cam=T_ee_cam,
-                            pause_forward=bool(pause_fwd),
-                        )
+                        if (
+                            bool(getattr(cfg, "approach_top_descend", False))
+                            and p_obj_for_state is not None
+                        ):
+                            # Look-at descent: come down onto the object from a
+                            # steep vantage while the IK keeps the camera pointed
+                            # at it, so it stays centered in frame the whole way.
+                            # planned_step=0 skips the radial retry below.
+                            q_apr, _p_eye_td, _pos_err_td = _top_descend_q(
+                                joints_deg=joints,
+                                T_base_ee_cur=T_base_ee_cur,
+                                T_base_cam_cur=T_base_cam_cur,
+                                T_ee_cam=T_ee_cam,
+                                p_obj_base=p_obj_for_state,
+                                standoff_m=float(approach_target_m),
+                                cfg=cfg,
+                                dt=dt_target,
+                                kin=kin,
+                                live=live,
+                            )
+                            planned_step = 0.0
+                            fov_scale = 1.0
+                        else:
+                            q_apr, planned_step, fov_scale = _approach_q(
+                                joints_deg=joints,
+                                T_base_ee_cur=T_base_ee_cur,
+                                T_base_cam_cur=T_base_cam_cur,
+                                d_obj_m=float(d_cmd),
+                                p_obj_base=p_obj_for_state,
+                                pixel_err_px=float(pixel_err),
+                                pan_err_px=float(pan_err_px),
+                                vertical_err_px=float(vertical_err_px),
+                                cfg=cfg,
+                                dt=dt_target,
+                                kin=kin,
+                                final_standoff_m=float(approach_target_m),
+                                max_lin_vel_m_s=apr_lin,
+                                max_joint_step_deg=apr_dq,
+                                fov_scale_min=apr_fov_min,
+                                ik_orientation_weight=apr_ow,
+                                coarse_approach=bool(coarse_apr),
+                                T_ee_cam=T_ee_cam,
+                                pause_forward=bool(pause_fwd),
+                            )
                         approach_step_m = float(planned_step)
                         approach_fov_scale = float(fov_scale)
                         if q_apr is not None and planned_step > 1e-5 and not pause_fwd:
@@ -3395,6 +3554,21 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
 
             q_cmd[i_pan] = float(q_cmd[i_pan]) + float(d_pan)
             q_cmd[i_tilt] = float(q_cmd[i_tilt]) + float(d_tilt)
+
+            # Final shake suppression for the look-at descent: cap the per-tick
+            # change of the WHOLE command (IK + gaze) so residual detector noise
+            # can't make the arm twitch on the way down.
+            if (
+                state == "APPROACHING"
+                and bool(getattr(cfg, "approach_top_descend", False))
+                and float(getattr(cfg, "approach_top_output_slew_deg", 0.0)) > 0.0
+            ):
+                slew = float(cfg.approach_top_output_slew_deg)
+                q_ref = np.asarray(joints, dtype=np.float64)
+                dq_out = np.asarray(q_cmd, dtype=np.float64) - q_ref
+                peak = float(np.max(np.abs(dq_out))) if dq_out.size else 0.0
+                if peak > slew and peak > 1e-9:
+                    q_cmd = q_ref + dq_out * (slew / peak)
 
             q_out = _apply_live_joint_trims(cfg, live, q_cmd)
             act = {f"{m}.pos": float(q_out[i]) for i, m in enumerate(ARM_MOTORS)}
@@ -3559,6 +3733,7 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
                 live["_pan_regress_streak"] = 0
                 live["_approach_best_d"] = None
                 live["_approach_stall_ticks"] = 0
+                live["_top_obj_filt"] = None
                 if gaze_uv is not None:
                     live["_approach_uv_lock"] = (
                         float(gaze_uv[0]),
@@ -3663,6 +3838,8 @@ def run_gaze_engine(cfg: GazeEngineConfig) -> None:
 
             _sleep(loop_t, dt_target)
     except KeyboardInterrupt:
+        interrupted = True
         logger.info("[gaze-engine] interrupted by user.")
     finally:
+        home_ctrl.on_exit(robot, interrupted=interrupted)
         _restore_stdin_tty(live)

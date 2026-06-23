@@ -28,6 +28,15 @@ lerobot-gaze-engine \
   --search-startup-lock-frames=2 \
   --search-min-detection-confidence=0.18 \
   --approach-el-deg=60 \
+  --approach-top-descend=true \
+  --approach-top-el-deg=70 \
+  --approach-top-az-auto=true \
+  --approach-top-max-lin-vel-m-s=0.035 \
+  --approach-top-max-ang-vel-deg-s=40 \
+  --approach-top-max-joint-step-deg=2.5 \
+  --approach-top-ik-orientation-weight=0.6 \
+  --approach-top-obj-ema-alpha=0.25 \
+  --approach-top-output-slew-deg=3.0 \
   --approach-steep-always-optical=true \
   --approach-coarse-look-at=false \
   --approach-coarse-ik-orientation-weight=0 \

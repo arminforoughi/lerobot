@@ -1,0 +1,13 @@
+motor_names:
+- shoulder_pan
+- shoulder_lift
+- elbow_flex
+- wrist_flex
+- wrist_roll
+joints_deg:
+- -9.67
+- -102.022
+- 98.066
+- 32.879
+- -22.374
+gripper_pct: 3.626
