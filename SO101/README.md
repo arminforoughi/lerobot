@@ -4,11 +4,9 @@ This directory is intended to hold URDF and MuJoCo (MJCF) files for the SO101 ro
 
 ## Getting the URDF
 
-The URDF is not bundled in this repo. Download it from the [SO-ARM100](https://github.com/TheRobotStudio/SO-ARM100) project and place it here:
+The calibrated URDF and STL mesh assets are bundled in this directory (`so101_new_calib.urdf` + `assets/*.stl`, from [SO-ARM100](https://github.com/TheRobotStudio/SO-ARM100)).
 
-- **Recommended**: [so101_new_calib.urdf](https://github.com/TheRobotStudio/SO-ARM100/blob/main/Simulation/SO101/so101_new_calib.urdf) — save as `SO101/so101_new_calib.urdf`
-
-Then run scripts with: `--urdf=./SO101/so101_new_calib.urdf` (or `--urdf=./SO101` if the file is present).
+Run scripts with: `--urdf=./SO101/so101_new_calib.urdf` (or `--urdf=./SO101` if the file is present).
 
 ## Overview
 
